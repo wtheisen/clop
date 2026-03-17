@@ -31,8 +31,8 @@ VIEW_PROCESSES = 1
 VIEW_HISTORY = 2
 VIEW_NAMES = ["Sessions", "Processes", "History"]
 
-SORT_MODES_SESSIONS = ["context", "tokens", "msgs", "time"]
-SORT_LABELS_SESSIONS = {"context": "CTX%", "tokens": "TOKENS", "msgs": "MSGS", "time": "TIME"}
+SORT_MODES_SESSIONS = ["activity", "context", "tokens", "msgs", "time"]
+SORT_LABELS_SESSIONS = {"activity": "ACTIVITY", "context": "CTX%", "tokens": "TOKENS", "msgs": "MSGS", "time": "TIME"}
 SORT_MODES_PROCS = ["cpu", "mem", "pid", "time"]
 SORT_LABELS_PROCS = {"cpu": "CPU%", "mem": "MEM%", "pid": "PID", "time": "TIME"}
 
@@ -784,6 +784,10 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
     sort_key = SORT_MODES_SESSIONS[sort_idx]
 
     key_fn = {
+        "activity": lambda s: (
+            0 if s["activity"] in ACTIVITY_IDLE else 1,  # waiting first
+            s["context_pct"],
+        ),
         "context": lambda s: s["context_pct"],
         "tokens": lambda s: s["output_tokens"],
         "msgs": lambda s: s["msg_count"],
