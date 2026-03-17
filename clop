@@ -616,6 +616,7 @@ def main(stdscr):
     sort_idx_sessions = 0
     sort_idx_procs = 0
     scroll_offset = 0
+    selected_idx = -1  # -1 = no session selected
     paused = False
 
     # Prime CPU
@@ -635,6 +636,7 @@ def main(stdscr):
         elif key == ord("\t") or key == ord("v") or key == ord("V"):
             view_mode = (view_mode + 1) % 3
             scroll_offset = 0
+            selected_idx = -1
         elif key == ord("1"):
             view_mode = VIEW_SESSIONS
             scroll_offset = 0
@@ -663,6 +665,12 @@ def main(stdscr):
             scroll_offset = min(scroll_offset + 1, max(0, max_items - 1))
         elif key == curses.KEY_HOME:
             scroll_offset = 0
+        elif key == ord("\n") or key == ord(" "):
+            if view_mode == VIEW_SESSIONS:
+                if selected_idx == scroll_offset:
+                    selected_idx = -1  # deselect
+                else:
+                    selected_idx = scroll_offset
 
         if paused:
             try:
@@ -732,7 +740,8 @@ def main(stdscr):
         # ── View-specific content ──
         if view_mode == VIEW_SESSIONS:
             row = draw_sessions_view(stdscr, row, h, w, sessions,
-                                     sort_idx_sessions, scroll_offset, spin_frame, C)
+                                     sort_idx_sessions, scroll_offset, selected_idx,
+                                     spin_frame, C)
         elif view_mode == VIEW_PROCESSES:
             row = draw_processes_view(stdscr, row, h, w, procs,
                                       sort_idx_procs, scroll_offset, C)
@@ -741,7 +750,7 @@ def main(stdscr):
                                     scroll_offset, C)
 
         # ── Footer ──
-        footer = " q:Quit  Tab/v:View  s:Sort  p:Pause  1-3:View  ↑↓:Scroll "
+        footer = " q:Quit  Tab/v:View  s:Sort  p:Pause  1-3:View  ↑↓:Scroll  Enter:Details "
         safe_addstr(stdscr, h - 1, 0, " " * w, SEL_HDR)
         safe_addstr(stdscr, h - 1, 1, truncate(footer, w - 2), SEL_HDR)
 
@@ -763,8 +772,8 @@ THINKING_WORDS = [
 
 
 def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
-                       spin_frame, C):
-    """Draw sessions as cards with project name as heading."""
+                       selected_idx, spin_frame, C):
+    """Draw sessions as single rows; expand stats for selected session."""
     sort_key = SORT_MODES_SESSIONS[sort_idx]
 
     key_fn = {
@@ -782,13 +791,16 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
         safe_addstr(stdscr, row, max(0, (w - 28) // 2), "Start one with: claude", C["dim"])
         return row + 1
 
-    rows_per_card = 4  # status+bar, stats, agents (optional), separator
-    max_visible = (h - row - 1) // rows_per_card
-    visible = sessions[scroll_offset: scroll_offset + max(1, max_visible)]
+    avail = h - row - 1
+    max_visible = max(1, avail)  # 1 row per session normally
+    visible = sessions[scroll_offset: scroll_offset + max_visible]
 
-    for s in visible:
-        if row + 2 >= h:
+    for i, s in enumerate(visible):
+        if row >= h - 1:
             break
+
+        session_abs_idx = scroll_offset + i
+        is_selected = (session_abs_idx == selected_idx)
 
         pct = s["context_pct"]
         ctx_color = C["red"] if pct > 80 else (C["amber"] if pct > 50 else C["green"])
@@ -865,45 +877,40 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
             safe_addstr(stdscr, row, right_pos + len(slug) + 2, model, C["beige"])
         row += 1
 
-        # ── Row 3: Stats + permission mode ──
-        perm = s.get("permission_mode", "?")
-        perm_label = {
-            "bypassPermissions": "bypass",
-            "acceptEdits": "accept-edits",
-            "default": "default",
-            "dontAsk": "dont-ask",
-            "plan": "plan",
-            "auto": "auto",
-        }.get(perm, perm)
+        # ── Expanded details (only for selected session) ──
+        if is_selected and row < h - 1:
+            perm = s.get("permission_mode", "?")
+            perm_label = {
+                "bypassPermissions": "bypass",
+                "acceptEdits": "accept-edits",
+                "default": "default",
+                "dontAsk": "dont-ask",
+                "plan": "plan",
+                "auto": "auto",
+            }.get(perm, perm)
 
-        stats_parts = [
-            f"Msgs {s['msg_count']}",
-            f"Tools {s['tool_calls']}",
-            f"Out {format_tokens(s['output_tokens'])}",
-            f"PID {s['pid']}",
-            f"MEM {format_bytes(s['mem']).strip()}",
-        ]
-        stats_line = "  │  ".join(stats_parts)
-        safe_addstr(stdscr, row, 4, truncate(stats_line, w - 5), C["slate"])
-        # Permission badge at the end
-        perm_str = f" [{perm_label}]"
-        perm_pos = 4 + len(stats_line) + 1
-        if perm_pos + len(perm_str) < w:
-            perm_color = C["amber"] if perm_label == "bypass" else C["dim"]
-            safe_addstr(stdscr, row, perm_pos, perm_str, perm_color)
-        row += 1
-
-        # ── Row 4: Subagents (if any), else separator ──
-        subagents = s.get("subagents", [])
-        if subagents and row < h - 2:
-            agent_strs = [f"{a['type']}: {a['desc']}" for a in subagents[:3]]
-            agent_line = f"  agents: " + "  │  ".join(agent_strs)
-            safe_addstr(stdscr, row, 4, truncate(agent_line, w - 5), C["beige"])
+            stats_parts = [
+                f"Msgs {s['msg_count']}",
+                f"Tools {s['tool_calls']}",
+                f"Out {format_tokens(s['output_tokens'])}",
+                f"PID {s['pid']}",
+                f"MEM {format_bytes(s['mem']).strip()}",
+            ]
+            stats_line = "  │  ".join(stats_parts)
+            safe_addstr(stdscr, row, 4, truncate(stats_line, w - 5), C["slate"])
+            perm_str = f" [{perm_label}]"
+            perm_pos = 4 + len(stats_line) + 1
+            if perm_pos + len(perm_str) < w:
+                perm_color = C["amber"] if perm_label == "bypass" else C["dim"]
+                safe_addstr(stdscr, row, perm_pos, perm_str, perm_color)
             row += 1
 
-        # ── Separator ──
-        safe_addstr(stdscr, row, 2, "·" * (w - 4), C["dim"])
-        row += 1
+            subagents = s.get("subagents", [])
+            if subagents and row < h - 1:
+                agent_strs = [f"{a['type']}: {a['desc']}" for a in subagents[:3]]
+                agent_line = f"  agents: " + "  │  ".join(agent_strs)
+                safe_addstr(stdscr, row, 4, truncate(agent_line, w - 5), C["beige"])
+                row += 1
 
     return row
 
