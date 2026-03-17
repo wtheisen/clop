@@ -792,8 +792,44 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
         return row + 1
 
     avail = h - row - 1
-    max_visible = max(1, avail)  # 1 row per session normally
+    max_visible = max(1, avail)
     visible = sessions[scroll_offset: scroll_offset + max_visible]
+
+    # ── Compute fixed column widths from all visible data ──
+    proj_w = max((len(s["project"] or "~") for s in visible), default=4)
+    proj_w = max(proj_w, 4)  # minimum
+
+    # Status column: widest status text across sessions
+    def status_len(s):
+        activity = s.get("activity", "Idle")
+        uptime = format_time(s["elapsed"])
+        out_tok = format_tokens(s["output_tokens"])
+        if activity not in ACTIVITY_IDLE:
+            word_idx = s["pid"] % len(THINKING_WORDS)
+            fun_word = THINKING_WORDS[word_idx]
+            phase = "thinking"
+            if "Responding" in activity:
+                phase = "responding"
+            elif "Using " in activity or "Running " in activity:
+                phase = (activity.split(" ", 1)[1] if " " in activity else "tool").lower()
+            # "✶ Word… (time · ↓ tok tokens · phase)"
+            return 2 + len(fun_word) + 2 + len(f"({uptime} · ↓ {out_tok} tokens · {phase})")
+        else:
+            return 2 + len(f"Waiting ({uptime} · ↓ {out_tok} tokens)")
+
+    status_w = max((status_len(s) for s in visible), default=20)
+
+    bar_w = max(6, int(w * 0.12))
+    ctx_label_w = 12  # " 100.5K/1.0M"
+    model_w = 12  # "sonnet-4.5  "
+    slug_w = max((len(s.get("slug", "")) for s in visible), default=0)
+    right_w = slug_w + 2 + model_w if slug_w else model_w
+
+    # Fixed column positions
+    col_proj = 1
+    col_status = col_proj + proj_w + 1
+    col_bar = col_status + status_w + 1
+    col_right = w - right_w - 1
 
     for i, s in enumerate(visible):
         if row >= h - 1:
@@ -804,30 +840,25 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
 
         pct = s["context_pct"]
         ctx_color = C["red"] if pct > 80 else (C["amber"] if pct > 50 else C["green"])
-        bar_color = C["bar_red"] if pct > 80 else (C["bar_amber"] if pct > 50 else C["bar_green"])
         slug = s.get("slug", "")
         activity = s.get("activity", "Idle")
         is_active = activity not in ACTIVITY_IDLE
 
-        # ── Row 1: Project name + Claude-style status line ──
         project = s["project"] or "~"
         model = shorten_model(s["model"])
         uptime = format_time(s["elapsed"])
         out_tok = format_tokens(s["output_tokens"])
 
-        col = 2
-        safe_addstr(stdscr, row, col, project, C["peach"] | curses.A_BOLD)
-        col += len(project) + 1
+        # ── Col 1: Project name ──
+        safe_addstr(stdscr, row, col_proj, truncate(project, proj_w), C["peach"] | curses.A_BOLD)
 
+        # ── Col 2: Status ──
+        col = col_status
         if is_active:
-            # Animated spinner + fun word + details, like:
-            # ✶ Percolating… (23:03:40 · ↓ 8.1K tokens · thinking)
             spinner = SPINNER_FRAMES[spin_frame % len(SPINNER_FRAMES)]
-            # Pick a stable fun word per session (hash pid so it doesn't change every frame)
             word_idx = s["pid"] % len(THINKING_WORDS)
             fun_word = THINKING_WORDS[word_idx]
 
-            # Map activity to a phase label
             phase = "thinking"
             if "Responding" in activity:
                 phase = "responding"
@@ -843,19 +874,14 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
 
             detail = f"({uptime} · ↓ {out_tok} tokens · {phase})"
             safe_addstr(stdscr, row, col, detail, C["slate"])
-            col += len(detail) + 1
         else:
             safe_addstr(stdscr, row, col, "●", C["green"])
             col += 2
             wait_text = f"Waiting ({uptime} · ↓ {out_tok} tokens)"
             safe_addstr(stdscr, row, col, wait_text, C["green"])
-            col += len(wait_text) + 1
 
-        # Inline context bar (left-aligned after status text)
-        bar_w = max(6, int(w * 0.15))
-        ctx_label = f" {format_tokens(s['total_context'])}/{format_tokens(s['context_max'])}"
-        if col + bar_w + len(ctx_label) < w:
-            # Color bar by usage level
+        # ── Col 3: Context bar ──
+        if col_bar + bar_w + ctx_label_w < col_right:
             if pct < 25:
                 bar_fg = C["green"]
             elif pct < 50:
@@ -864,17 +890,16 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
                 bar_fg = C["amber"]
             else:
                 bar_fg = C["red"]
-            draw_bar(stdscr, row, col, bar_w, pct, bar_fg, C["dim"])
-            col += bar_w
-            safe_addstr(stdscr, row, col, ctx_label, ctx_color)
-            col += len(ctx_label) + 1
+            draw_bar(stdscr, row, col_bar, bar_w, pct, bar_fg, C["dim"])
+            ctx_label = f" {format_tokens(s['total_context'])}/{format_tokens(s['context_max'])}"
+            safe_addstr(stdscr, row, col_bar + bar_w, ctx_label, ctx_color)
 
-        # Right-aligned: slug + model
-        right_info = f"{slug}  {model}"
-        right_pos = w - len(right_info) - 2
-        if right_pos > col + 1:
-            safe_addstr(stdscr, row, right_pos, slug, C["dim"])
-            safe_addstr(stdscr, row, right_pos + len(slug) + 2, model, C["beige"])
+        # ── Col 4: Right-aligned slug + model ──
+        if slug:
+            safe_addstr(stdscr, row, col_right, truncate(slug, slug_w), C["dim"])
+            safe_addstr(stdscr, row, col_right + slug_w + 2, model, C["beige"])
+        else:
+            safe_addstr(stdscr, row, w - model_w - 1, model, C["beige"])
         row += 1
 
         # ── Expanded details (only for selected session) ──
@@ -897,9 +922,9 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
                 f"MEM {format_bytes(s['mem']).strip()}",
             ]
             stats_line = "  │  ".join(stats_parts)
-            safe_addstr(stdscr, row, 4, truncate(stats_line, w - 5), C["slate"])
+            safe_addstr(stdscr, row, col_status, truncate(stats_line, w - col_status - 1), C["slate"])
             perm_str = f" [{perm_label}]"
-            perm_pos = 4 + len(stats_line) + 1
+            perm_pos = col_status + len(stats_line) + 1
             if perm_pos + len(perm_str) < w:
                 perm_color = C["amber"] if perm_label == "bypass" else C["dim"]
                 safe_addstr(stdscr, row, perm_pos, perm_str, perm_color)
@@ -908,9 +933,14 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, scroll_offset,
             subagents = s.get("subagents", [])
             if subagents and row < h - 1:
                 agent_strs = [f"{a['type']}: {a['desc']}" for a in subagents[:3]]
-                agent_line = f"  agents: " + "  │  ".join(agent_strs)
-                safe_addstr(stdscr, row, 4, truncate(agent_line, w - 5), C["beige"])
+                agent_line = "agents: " + "  │  ".join(agent_strs)
+                safe_addstr(stdscr, row, col_status, truncate(agent_line, w - col_status - 1), C["beige"])
                 row += 1
+
+        # ── Separator ──
+        if row < h - 1:
+            safe_addstr(stdscr, row, 1, "─" * (w - 2), C["dim"])
+            row += 1
 
     return row
 
