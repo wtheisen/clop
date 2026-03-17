@@ -242,6 +242,7 @@ def get_session_context(session_id, cwd):
         last_user_seq = 0
         last_user_ctypes = []
         last_progress_type = ""  # "agent_progress" if subagent is active
+        turn_ended = False  # set when we see a turn_duration system entry
         permission_mode = "?"
 
         with open(jsonl_path, "rb") as f:
@@ -292,6 +293,10 @@ def get_session_context(session_id, cwd):
                 # Track last message state for activity detection
                 entry_type = entry.get("type", "")
 
+                # Detect turn completion from system entries
+                if entry_type == "system" and entry.get("subtype") == "turn_duration":
+                    turn_ended = True
+
                 # Track progress entries for subagent detection
                 if entry_type == "progress":
                     progress_data_type = entry.get("data", {}).get("type", "")
@@ -301,6 +306,7 @@ def get_session_context(session_id, cwd):
                 elif entry_type in ("assistant", "user"):
                     # A real assistant/user entry after agent_progress means agent finished
                     last_progress_type = ""
+                    turn_ended = False  # new turn started
 
                 msg_count += 1
 
@@ -362,24 +368,25 @@ def get_session_context(session_id, cwd):
         # Everything else gets an active status describing what's happening.
         activity = "Idle"
 
-        if last_progress_type == "agent_progress":
+        # turn_duration system entry is the most reliable signal that a
+        # turn finished — Claude Code doesn't always rewrite the assistant
+        # entry with a final stop_reason.
+        if turn_ended:
+            activity = "Waiting"
+        elif last_progress_type == "agent_progress":
             # Subagent is actively running
             activity = "Running Agent"
         elif last_type == "assistant":
             if last_assistant_stop is not None:
                 if last_assistant_stop == "end_turn":
-                    # Model finished its turn — genuinely waiting for user
                     activity = "Waiting"
                 elif last_assistant_stop == "tool_use":
                     tool_label = last_assistant_tool or "tool"
                     if last_user_seq > last_assistant_seq and "tool_result" in last_user_ctypes:
-                        # Tool completed, result sent back — assistant processing
                         activity = "Thinking"
                     else:
-                        # Tool executing or awaiting approval
                         activity = f"Running {tool_label}"
                 else:
-                    # max_tokens, stop_sequence, etc — turn ended
                     activity = "Waiting"
             else:
                 # stop_reason is None → still streaming
