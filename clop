@@ -823,8 +823,7 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
             return (activity.split(" ", 1)[1] if " " in activity else "tool").lower()
         return "thinking"
 
-    phase_w = max((len(get_phase(s)) for s in visible), default=8)
-    phase_w = max(phase_w, 5)  # at least "PHASE"
+    phase_w = 24  # fixed width — long MCP tool names get truncated
 
     bar_w = max(6, int(w * 0.12))
     ctx_label_w = 12  # " 100.5K/1.0M"
@@ -902,7 +901,7 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
         phase = get_phase(s)
         if phase:
             phase_color = C["brand"] if phase == "thinking" else C["amber"]
-            safe_addstr(stdscr, row, col_phase, phase, phase_color)
+            safe_addstr(stdscr, row, col_phase, truncate(phase, phase_w), phase_color)
 
         # ── Col 3: Context bar ──
         if col_bar + bar_w + ctx_label_w < col_right:
