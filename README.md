@@ -4,16 +4,20 @@ A `top`-like TUI for monitoring [Claude Code](https://docs.anthropic.com/en/docs
 
 ![Python 3](https://img.shields.io/badge/python-3.8+-blue)
 
+![clop sessions view](screenshots/sessions-view.png)
+
+![clop overview](screenshots/overview.png)
+
 ## Features
 
 ### Sessions View
 - Live status for every active Claude Code session (thinking, responding, running tools, waiting, etc.)
 - Animated spinner with Claude-style fun status words (Pondering, Ruminating, Clauding, ...)
+- Aligned columns: PROJECT, STATUS, TIME, OUTPUT, PHASE, CONTEXT, SLUG, MODEL
 - Context window usage bar with color-coded fill (green/amber/red)
-- Per-session stats: message count, tool calls, output tokens, memory, PID
-- Model display (opus-4.6, sonnet-4.5, haiku, ...)
-- Permission mode badge (bypass, default, auto, ...)
-- Subagent tracking
+- Select a session with Enter/Space to expand details (message count, tool calls, PID, memory, permission mode, subagents)
+- Auto-sort: sessions waiting for input float to the top
+- Cursor indicator (`▸`) shows current selection
 
 ### Processes View
 - All Claude-related OS processes (Claude Code, MCP servers, Node workers)
@@ -27,10 +31,11 @@ A `top`-like TUI for monitoring [Claude Code](https://docs.anthropic.com/en/docs
 
 ### General
 - Anthropic brand color palette (terracotta, beige, amber) with graceful 8-color fallback
-- Sortable columns (context%, tokens, messages, time, CPU, memory, PID)
-- Keyboard-driven: Tab/1-2-3 to switch views, `s` to cycle sort, arrows to scroll, `p` to pause
+- Sortable columns: activity, context%, tokens, messages, time (press `s` to cycle)
+- Keyboard-driven: Tab/1-2-3 to switch views, arrows to scroll, Enter to expand, `p` to pause
 - Efficient tail-read of JSONL conversation files (reads last 512KB, not the whole file)
 - Auto-refreshing data every 2 seconds with 80ms render loop for smooth animation
+- SLUG and MODEL columns gracefully hide on narrow terminals, CONTEXT always visible
 
 ## Requirements
 
@@ -73,8 +78,9 @@ cp clop /usr/local/bin/clop
 | `1` `2` `3` | Jump to Sessions / Processes / History |
 | `s` | Cycle sort column |
 | `p` | Pause / resume |
-| `Up` / `Down` | Scroll |
-| `Home` | Scroll to top |
+| `Up` / `Down` | Move cursor |
+| `Enter` / `Space` | Expand / collapse session details |
+| `Home` | Jump to top |
 
 ## How It Works
 
