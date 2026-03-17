@@ -802,48 +802,57 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
 
     # ── Compute fixed column widths from all visible data ──
     proj_w = max((len(s["project"] or "~") for s in visible), default=4)
-    proj_w = max(proj_w, 4)  # minimum
+    proj_w = max(proj_w, 7)  # at least "PROJECT"
 
-    # Status column: widest status text across sessions
-    def status_len(s):
+    # Status word width (fun word or "Waiting")
+    fun_word_w = max(len(THINKING_WORDS[s["pid"] % len(THINKING_WORDS)]) + 3
+                     for s in visible) if visible else 12  # "Word… " + spinner
+    fun_word_w = max(fun_word_w, 9)  # at least "Waiting "
+
+    time_w = 8   # "HH:MM:SS"
+    out_w = 7    # "999.9M"
+
+    # Phase: derive for width calc
+    def get_phase(s):
         activity = s.get("activity", "Idle")
-        uptime = format_time(s["elapsed"])
-        out_tok = format_tokens(s["output_tokens"])
-        if activity not in ACTIVITY_IDLE:
-            word_idx = s["pid"] % len(THINKING_WORDS)
-            fun_word = THINKING_WORDS[word_idx]
-            phase = "thinking"
-            if "Responding" in activity:
-                phase = "responding"
-            elif "Using " in activity or "Running " in activity:
-                phase = (activity.split(" ", 1)[1] if " " in activity else "tool").lower()
-            # "✶ Word… (time · ↓ tok tokens · phase)"
-            return 2 + len(fun_word) + 2 + len(f"({uptime} · ↓ {out_tok} tokens · {phase})")
-        else:
-            return 2 + len(f"Waiting ({uptime} · ↓ {out_tok} tokens)")
+        if activity in ACTIVITY_IDLE:
+            return ""
+        if "Responding" in activity:
+            return "responding"
+        if "Using " in activity or "Running " in activity:
+            return (activity.split(" ", 1)[1] if " " in activity else "tool").lower()
+        return "thinking"
 
-    status_w = max((status_len(s) for s in visible), default=20)
+    phase_w = max((len(get_phase(s)) for s in visible), default=8)
+    phase_w = max(phase_w, 5)  # at least "PHASE"
 
     bar_w = max(6, int(w * 0.12))
     ctx_label_w = 12  # " 100.5K/1.0M"
-    model_w = 12  # "sonnet-4.5  "
+    model_w = 12
     slug_w = max((len(s.get("slug", "")) for s in visible), default=0)
     right_w = slug_w + 2 + model_w if slug_w else model_w
 
     # Fixed column positions (col 0 reserved for cursor indicator)
     col_proj = 2
     col_status = col_proj + proj_w + 1
-    col_bar = col_status + status_w + 1
+    col_time = col_status + fun_word_w + 1
+    col_out = col_time + time_w + 1
+    col_phase = col_out + out_w + 1
+    col_bar = col_phase + phase_w + 1
     col_right = w - right_w - 1
 
     # ── Column headers ──
-    safe_addstr(stdscr, row, col_proj, "PROJECT", C["beige"] | curses.A_BOLD)
-    safe_addstr(stdscr, row, col_status, "STATUS", C["beige"] | curses.A_BOLD)
+    hdr = C["beige"] | curses.A_BOLD
+    safe_addstr(stdscr, row, col_proj, "PROJECT", hdr)
+    safe_addstr(stdscr, row, col_status, "STATUS", hdr)
+    safe_addstr(stdscr, row, col_time, "TIME", hdr)
+    safe_addstr(stdscr, row, col_out, "OUTPUT", hdr)
+    safe_addstr(stdscr, row, col_phase, "PHASE", hdr)
     if col_bar + bar_w + ctx_label_w < col_right:
-        safe_addstr(stdscr, row, col_bar, "CONTEXT", C["beige"] | curses.A_BOLD)
+        safe_addstr(stdscr, row, col_bar, "CONTEXT", hdr)
     if slug_w:
-        safe_addstr(stdscr, row, col_right, "SLUG", C["beige"] | curses.A_BOLD)
-    safe_addstr(stdscr, row, w - model_w - 1, "MODEL", C["beige"] | curses.A_BOLD)
+        safe_addstr(stdscr, row, col_right, "SLUG", hdr)
+    safe_addstr(stdscr, row, w - model_w - 1, "MODEL", hdr)
     row += 1
     safe_addstr(stdscr, row, 1, "─" * (w - 2), C["dim"])
     row += 1
@@ -874,33 +883,26 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
         # ── Col 1: Project name ──
         safe_addstr(stdscr, row, col_proj, truncate(project, proj_w), C["peach"] | curses.A_BOLD)
 
-        # ── Col 2: Status ──
-        col = col_status
+        # ── Col 2: Status indicator + word ──
         if is_active:
             spinner = SPINNER_FRAMES[spin_frame % len(SPINNER_FRAMES)]
             word_idx = s["pid"] % len(THINKING_WORDS)
             fun_word = THINKING_WORDS[word_idx]
-
-            phase = "thinking"
-            if "Responding" in activity:
-                phase = "responding"
-            elif "Using " in activity or "Running " in activity:
-                tool = activity.split(" ", 1)[1] if " " in activity else "tool"
-                phase = tool.lower()
-
-            safe_addstr(stdscr, row, col, spinner, C["brand"])
-            col += 2
-            status_word = f"{fun_word}…"
-            safe_addstr(stdscr, row, col, status_word, C["brand"])
-            col += len(status_word) + 1
-
-            detail = f"({uptime} · ↓ {out_tok} tokens · {phase})"
-            safe_addstr(stdscr, row, col, detail, C["slate"])
+            safe_addstr(stdscr, row, col_status, f"{spinner} {fun_word}…", C["brand"])
         else:
-            safe_addstr(stdscr, row, col, "●", C["green"])
-            col += 2
-            wait_text = f"Waiting ({uptime} · ↓ {out_tok} tokens)"
-            safe_addstr(stdscr, row, col, wait_text, C["green"])
+            safe_addstr(stdscr, row, col_status, "● Waiting", C["green"])
+
+        # ── Col 3: Time ──
+        safe_addstr(stdscr, row, col_time, uptime, C["slate"])
+
+        # ── Col 4: Output tokens ──
+        safe_addstr(stdscr, row, col_out, out_tok, C["slate"])
+
+        # ── Col 5: Phase ──
+        phase = get_phase(s)
+        if phase:
+            phase_color = C["brand"] if phase == "thinking" else C["amber"]
+            safe_addstr(stdscr, row, col_phase, phase, phase_color)
 
         # ── Col 3: Context bar ──
         if col_bar + bar_w + ctx_label_w < col_right:
