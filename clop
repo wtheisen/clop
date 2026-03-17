@@ -699,62 +699,23 @@ def main(stdscr):
 
         row = 0
 
-        # ── Title bar ──
-        view_label = VIEW_NAMES[view_mode]
-        title = f" clop — {now}  [{view_label}] "
-        safe_addstr(stdscr, row, 0, " " * w, SEL_HDR)
-        safe_addstr(stdscr, row, max(0, (w - len(title)) // 2), title, SEL_HDR)
-        row += 1
-
-        # ── Summary bar: sessions + usage ──
+        # ── Single-row header ──
         n_sessions = len(sessions)
         n_procs = len(procs)
         total_cpu = sum(p["cpu"] for p in procs)
         total_mem = sum(p["mem_rss"] for p in procs)
-        total_ctx_tokens = sum(s["total_context"] for s in sessions)
-        total_out_tokens = sum(s["output_tokens"] for s in sessions)
 
-        # Get today's usage from stats cache
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        today_msgs = 0
-        today_tokens = 0
-        for d in stats_cache.get("dailyActivity", []):
-            if d.get("date") == today_str:
-                today_msgs = d.get("messageCount", 0)
-                break
-        for d in stats_cache.get("dailyModelTokens", []):
-            if d.get("date") == today_str:
-                today_tokens = sum(d.get("tokensByModel", {}).values())
-                break
-
-        # Lifetime totals
-        model_usage = stats_cache.get("modelUsage", {})
-        lifetime_out = sum(u.get("outputTokens", 0) for u in model_usage.values())
-        lifetime_cache = sum(u.get("cacheReadInputTokens", 0) for u in model_usage.values())
-
-        # Line 1: sessions and resource usage
-        summary = (
-            f" Sessions: {n_sessions}  "
-            f"Procs: {n_procs}  │  "
-            f"CPU: {total_cpu:5.1f}%  "
-            f"MEM: {format_bytes(total_mem).strip()}"
+        view_label = VIEW_NAMES[view_mode]
+        title = f" clop [{view_label}]"
+        stats_right = (
+            f"{n_sessions} sess  {n_procs} proc  "
+            f"CPU {total_cpu:.0f}%  MEM {format_bytes(total_mem).strip()}  "
+            f"{now} "
         )
-        safe_addstr(stdscr, row, 0, truncate(summary, w), BEIGE)
-        row += 1
 
-        # Line 2: token usage (today + lifetime)
-        usage_line = (
-            f" Today: {today_msgs} msgs  {format_tokens(today_tokens)} tokens  │  "
-            f"Active: ↓ {format_tokens(total_out_tokens)} out  "
-            f"ctx {format_tokens(total_ctx_tokens)}  │  "
-            f"Lifetime: {format_tokens(lifetime_out)} out  "
-            f"{format_tokens(lifetime_cache)} cached"
-        )
-        safe_addstr(stdscr, row, 0, truncate(usage_line, w), SLATE)
-        row += 1
-
-        # ── Separator ──
-        safe_addstr(stdscr, row, 0, "─" * (w - 1), BRAND)
+        safe_addstr(stdscr, row, 0, " " * w, SEL_HDR)
+        safe_addstr(stdscr, row, 0, title, SEL_HDR)
+        safe_addstr(stdscr, row, max(0, w - len(stats_right)), stats_right, SEL_HDR)
         row += 1
 
         spin_frame += 1
