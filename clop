@@ -829,7 +829,6 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
     ctx_label_w = 12  # " 100.5K/1.0M"
     model_w = 12
     slug_w = max((len(s.get("slug", "")) for s in visible), default=0)
-    right_w = slug_w + 2 + model_w if slug_w else model_w
 
     # Fixed column positions (col 0 reserved for cursor indicator)
     col_proj = 2
@@ -838,7 +837,11 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
     col_out = col_time + time_w + 1
     col_phase = col_out + out_w + 1
     col_bar = col_phase + phase_w + 1
-    col_right = w - right_w - 1
+    col_after_bar = col_bar + bar_w + ctx_label_w + 1
+
+    # Slug + model are optional — only show if room after context
+    show_slug = slug_w > 0 and col_after_bar + slug_w + 2 + model_w < w
+    show_model = col_after_bar + model_w < w
 
     # ── Column headers ──
     hdr = C["beige"] | curses.A_BOLD
@@ -847,11 +850,11 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
     safe_addstr(stdscr, row, col_time, "TIME", hdr)
     safe_addstr(stdscr, row, col_out, "OUTPUT", hdr)
     safe_addstr(stdscr, row, col_phase, "PHASE", hdr)
-    if col_bar + bar_w + ctx_label_w < col_right:
-        safe_addstr(stdscr, row, col_bar, "CONTEXT", hdr)
-    if slug_w:
-        safe_addstr(stdscr, row, col_right, "SLUG", hdr)
-    safe_addstr(stdscr, row, w - model_w - 1, "MODEL", hdr)
+    safe_addstr(stdscr, row, col_bar, "CONTEXT", hdr)
+    if show_slug:
+        safe_addstr(stdscr, row, w - slug_w - 2 - model_w - 1, "SLUG", hdr)
+    if show_model:
+        safe_addstr(stdscr, row, w - model_w - 1, "MODEL", hdr)
     row += 1
     safe_addstr(stdscr, row, 1, "─" * (w - 2), C["dim"])
     row += 1
@@ -903,25 +906,23 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
             phase_color = C["brand"] if phase == "thinking" else C["amber"]
             safe_addstr(stdscr, row, col_phase, truncate(phase, phase_w), phase_color)
 
-        # ── Col 3: Context bar ──
-        if col_bar + bar_w + ctx_label_w < col_right:
-            if pct < 25:
-                bar_fg = C["green"]
-            elif pct < 50:
-                bar_fg = C["brand"]
-            elif pct < 80:
-                bar_fg = C["amber"]
-            else:
-                bar_fg = C["red"]
-            draw_bar(stdscr, row, col_bar, bar_w, pct, bar_fg, C["dim"])
-            ctx_label = f" {format_tokens(s['total_context'])}/{format_tokens(s['context_max'])}"
-            safe_addstr(stdscr, row, col_bar + bar_w, ctx_label, ctx_color)
-
-        # ── Col 4: Right-aligned slug + model ──
-        if slug:
-            safe_addstr(stdscr, row, col_right, truncate(slug, slug_w), C["dim"])
-            safe_addstr(stdscr, row, col_right + slug_w + 2, model, C["beige"])
+        # ── Col 6: Context bar (always shown) ──
+        if pct < 25:
+            bar_fg = C["green"]
+        elif pct < 50:
+            bar_fg = C["brand"]
+        elif pct < 80:
+            bar_fg = C["amber"]
         else:
+            bar_fg = C["red"]
+        draw_bar(stdscr, row, col_bar, bar_w, pct, bar_fg, C["dim"])
+        ctx_label = f" {format_tokens(s['total_context'])}/{format_tokens(s['context_max'])}"
+        safe_addstr(stdscr, row, col_bar + bar_w, ctx_label, ctx_color)
+
+        # ── Col 7-8: Slug + Model (optional, right-aligned) ──
+        if show_slug and slug:
+            safe_addstr(stdscr, row, w - slug_w - 2 - model_w - 1, truncate(slug, slug_w), C["dim"])
+        if show_model:
             safe_addstr(stdscr, row, w - model_w - 1, model, C["beige"])
         row += 1
 
