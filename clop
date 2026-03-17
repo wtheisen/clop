@@ -791,7 +791,7 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
         safe_addstr(stdscr, row, max(0, (w - 28) // 2), "Start one with: claude", C["dim"])
         return row + 1
 
-    avail = h - row - 1
+    avail = h - row - 1 - 2  # subtract 2 for column header + separator
     # Each session takes 2 rows (content + separator), selected takes more
     max_visible = max(1, avail // 2)
     # Auto-scroll so cursor is always visible
@@ -835,6 +835,18 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
     col_status = col_proj + proj_w + 1
     col_bar = col_status + status_w + 1
     col_right = w - right_w - 1
+
+    # ── Column headers ──
+    safe_addstr(stdscr, row, col_proj, "PROJECT", C["beige"] | curses.A_BOLD)
+    safe_addstr(stdscr, row, col_status, "STATUS", C["beige"] | curses.A_BOLD)
+    if col_bar + bar_w + ctx_label_w < col_right:
+        safe_addstr(stdscr, row, col_bar, "CONTEXT", C["beige"] | curses.A_BOLD)
+    if slug_w:
+        safe_addstr(stdscr, row, col_right, "SLUG", C["beige"] | curses.A_BOLD)
+    safe_addstr(stdscr, row, w - model_w - 1, "MODEL", C["beige"] | curses.A_BOLD)
+    row += 1
+    safe_addstr(stdscr, row, 1, "─" * (w - 2), C["dim"])
+    row += 1
 
     for i, s in enumerate(visible):
         if row >= h - 1:
