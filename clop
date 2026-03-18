@@ -7,8 +7,7 @@ import glob
 import time
 import psutil
 import os
-import re
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 REFRESH_INTERVAL = 0.08  # seconds (fast spinner animation)
@@ -32,7 +31,7 @@ VIEW_HISTORY = 2
 VIEW_NAMES = ["Sessions", "Processes", "History"]
 
 SORT_MODES_SESSIONS = ["activity", "context", "tokens", "msgs", "time"]
-SORT_LABELS_SESSIONS = {"activity": "ACTIVITY", "context": "CTX%", "tokens": "TOKENS", "msgs": "MSGS", "time": "TIME"}
+SORT_LABELS_SESSIONS = {"activity": "ACTIVITY", "context": "CTX%", "tokens": "TOKENS", "msgs": "MSGS", "time": "TURN"}
 SORT_MODES_PROCS = ["cpu", "mem", "pid", "time"]
 SORT_LABELS_PROCS = {"cpu": "CPU%", "mem": "MEM%", "pid": "PID", "time": "TIME"}
 
@@ -63,6 +62,18 @@ def format_time(secs):
     return f"{m:d}:{s:02d}"
 
 
+def format_duration_human(secs):
+    """Format like Claude Code: '2m 3s', '45s', '1h 2m'."""
+    h = int(secs // 3600)
+    m = int((secs % 3600) // 60)
+    s = int(secs % 60)
+    if h > 0:
+        return f"{h}h {m}m"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 def truncate(s, width):
     if len(s) <= width:
         return s
@@ -91,10 +102,14 @@ def safe_addstr(stdscr, y, x, text, attr=0):
         pass
 
 
+_proc_cache = {}  # PID → psutil.Process; kept across refreshes for cpu_percent()
+
+
 def get_active_sessions():
     """Get all active Claude Code sessions with their metadata."""
     sessions = []
     session_files = glob.glob(str(CLAUDE_DIR / "sessions" / "*.json"))
+    seen_pids = set()
 
     for sf in session_files:
         try:
@@ -102,6 +117,7 @@ def get_active_sessions():
             # Check if process is alive
             if not psutil.pid_exists(pid):
                 continue
+            seen_pids.add(pid)
 
             with open(sf) as f:
                 data = json.load(f)
@@ -111,20 +127,61 @@ def get_active_sessions():
             started_at = data.get("startedAt", 0)
             elapsed = (time.time() * 1000 - started_at) / 1000 if started_at else 0
 
-            # Get process info
+            # Get process info — reuse cached Process object so
+            # cpu_percent(interval=0) can compare against prior measurement
             try:
-                proc = psutil.Process(pid)
+                if pid not in _proc_cache:
+                    _proc_cache[pid] = psutil.Process(pid)
+                proc = _proc_cache[pid]
                 cpu = proc.cpu_percent(interval=0)
                 mem = proc.memory_info().rss
-                # Count child processes
+                # Count and classify child processes
                 children = proc.children(recursive=True)
                 n_children = len(children)
                 total_mem = mem + sum(c.memory_info().rss for c in children if c.is_running())
+                child_types = {}
+                for c in children:
+                    try:
+                        cname = c.name().lower()
+                        # Normalize common process names
+                        if "bash" in cname:
+                            key = "bash"
+                        elif "zsh" in cname:
+                            key = "zsh"
+                        elif "sh" == cname:
+                            key = "sh"
+                        elif "python" in cname:
+                            key = "python"
+                        elif "node" in cname:
+                            key = "node"
+                        elif "deno" in cname:
+                            key = "deno"
+                        elif "bun" in cname:
+                            key = "bun"
+                        elif "cargo" in cname or "rustc" in cname:
+                            key = "cargo"
+                        elif "go" == cname:
+                            key = "go"
+                        elif "git" in cname:
+                            key = "git"
+                        elif "npm" in cname:
+                            key = "npm"
+                        elif "docker" in cname:
+                            key = "docker"
+                        elif "mcp" in cname:
+                            key = "mcp"
+                        else:
+                            key = cname.split("/")[-1][:10]
+                        child_types[key] = child_types.get(key, 0) + 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
             except (psutil.NoSuchProcess, psutil.AccessDenied):
+                _proc_cache.pop(pid, None)
                 cpu = 0
                 mem = 0
                 n_children = 0
                 total_mem = 0
+                child_types = {}
 
             # Find the conversation JSONL for this session
             ctx_info = get_session_context(session_id, cwd)
@@ -135,6 +192,7 @@ def get_active_sessions():
             if ctx_info["activity"] in ("Waiting", "Idle") and cpu > 5.0:
                 ctx_info["activity"] = "Active"
 
+
             sessions.append({
                 "pid": pid,
                 "session_id": session_id,
@@ -144,10 +202,15 @@ def get_active_sessions():
                 "cpu": cpu,
                 "mem": total_mem,
                 "children": n_children,
+                "child_types": child_types,
                 **ctx_info,
             })
         except (json.JSONDecodeError, ValueError, OSError):
             continue
+
+    # Evict cached Process objects for PIDs that no longer have sessions
+    for stale_pid in set(_proc_cache) - seen_pids:
+        del _proc_cache[stale_pid]
 
     return sessions
 
@@ -169,6 +232,8 @@ def get_session_context(session_id, cwd):
         "tool_calls": 0,
         "activity": "Idle",
         "slug": "",
+        "turn_start_ts": None,
+        "last_turn_duration": None,
     }
 
     if not session_id:
@@ -187,8 +252,14 @@ def get_session_context(session_id, cwd):
         candidate_dir = str(CLAUDE_DIR / "projects" / project_dir_name)
         if os.path.isdir(candidate_dir):
             project_dir = candidate_dir
-            # Find most recently modified JSONL in this project dir (top-level only)
+            # Find both the exact session_id match and the newest JSONL.
+            # After context compaction, Claude Code creates a new JSONL
+            # with a new ID — the session file still has the old ID.
+            # Use exact match if it's fresh; otherwise use newest.
+            exact = os.path.join(candidate_dir, f"{session_id}.jsonl")
+            exact_exists = os.path.exists(exact)
             best_mtime = 0
+            newest_path = None
             for f in os.listdir(candidate_dir):
                 if f.endswith(".jsonl"):
                     fpath = os.path.join(candidate_dir, f)
@@ -196,9 +267,21 @@ def get_session_context(session_id, cwd):
                         mt = os.path.getmtime(fpath)
                         if mt > best_mtime:
                             best_mtime = mt
-                            jsonl_path = fpath
+                            newest_path = fpath
                     except OSError:
                         pass
+            if exact_exists:
+                try:
+                    exact_mt = os.path.getmtime(exact)
+                except OSError:
+                    exact_mt = 0
+                # If newest is >30s newer than exact, compaction happened
+                if newest_path and best_mtime - exact_mt > 30:
+                    jsonl_path = newest_path
+                else:
+                    jsonl_path = exact
+            elif newest_path:
+                jsonl_path = newest_path
 
     if not jsonl_path:
         # Fall back: search all project dirs by exact session_id
@@ -216,6 +299,7 @@ def get_session_context(session_id, cwd):
     try:
         # Read last chunk of file for recent messages
         file_size = os.path.getsize(jsonl_path)
+        jsonl_mtime = os.path.getmtime(jsonl_path)
         read_size = min(file_size, 512 * 1024)  # last 512KB
 
         msg_count = 0
@@ -228,7 +312,6 @@ def get_session_context(session_id, cwd):
         total_cache_read = 0
         total_cache_write = 0
         last_type = ""
-        last_role = ""
         last_content_types = []
         last_tool_name = ""
         # Track assistant state separately: the last assistant entry
@@ -236,6 +319,7 @@ def get_session_context(session_id, cwd):
         last_assistant_stop = None  # None = no assistant msg seen, or still streaming
         last_assistant_ctypes = []
         last_assistant_tool = ""
+        last_assistant_ts = None  # ISO timestamp of the last assistant entry
         # Sequence tracking for chronological ordering
         entry_seq = 0
         last_assistant_seq = 0
@@ -243,6 +327,8 @@ def get_session_context(session_id, cwd):
         last_user_ctypes = []
         last_progress_type = ""  # "agent_progress" if subagent is active
         turn_ended = False  # set when we see a turn_duration system entry
+        turn_start_ts = None  # ISO timestamp of the user message that started the current turn
+        last_turn_duration = None  # seconds, from turn_duration system entry
         permission_mode = "?"
 
         with open(jsonl_path, "rb") as f:
@@ -262,6 +348,34 @@ def get_session_context(session_id, cwd):
 
                 if entry.get("slug"):
                     last_slug = entry["slug"]
+
+                # Track entry type BEFORE the message guard — system and
+                # progress entries may lack a "message" dict but still
+                # carry turn_duration / activity signals.
+                entry_type = entry.get("type", "")
+
+                # Detect turn completion from system entries
+                if entry_type == "system" and entry.get("subtype") == "turn_duration":
+                    turn_ended = True
+                    dur_ms = entry.get("durationMs") or entry.get("duration_ms")
+                    if dur_ms:
+                        try:
+                            last_turn_duration = float(dur_ms) / 1000
+                        except (ValueError, TypeError):
+                            pass
+
+                # Track progress entries for subagent detection
+                if entry_type == "progress":
+                    progress_data_type = entry.get("data", {}).get("type", "")
+                    if progress_data_type == "agent_progress":
+                        last_progress_type = "agent_progress"
+                elif entry_type in ("assistant", "user"):
+                    last_progress_type = ""
+                    turn_ended = False  # new turn started
+                    if entry_type == "user":
+                        ts = entry.get("timestamp")
+                        if ts:
+                            turn_start_ts = ts
 
                 msg = entry.get("message", {})
                 if not isinstance(msg, dict):
@@ -290,30 +404,11 @@ def get_session_context(session_id, cwd):
                         if isinstance(item, dict) and item.get("type") == "tool_use":
                             tool_calls += 1
 
-                # Track last message state for activity detection
-                entry_type = entry.get("type", "")
-
-                # Detect turn completion from system entries
-                if entry_type == "system" and entry.get("subtype") == "turn_duration":
-                    turn_ended = True
-
-                # Track progress entries for subagent detection
-                if entry_type == "progress":
-                    progress_data_type = entry.get("data", {}).get("type", "")
-                    if progress_data_type == "agent_progress":
-                        last_progress_type = "agent_progress"
-                    # Non-agent progress doesn't clear agent state
-                elif entry_type in ("assistant", "user"):
-                    # A real assistant/user entry after agent_progress means agent finished
-                    last_progress_type = ""
-                    turn_ended = False  # new turn started
-
                 msg_count += 1
 
                 if entry_type in ("assistant", "user"):
                     entry_seq += 1
                     last_type = entry_type
-                    last_role = msg.get("role", "")
                     last_content_types = []
                     last_tool_name = ""
                     if isinstance(content, list):
@@ -332,6 +427,7 @@ def get_session_context(session_id, cwd):
                         last_assistant_tool = last_tool_name
                         last_assistant_stop = stop
                         last_assistant_seq = entry_seq
+                        last_assistant_ts = entry.get("timestamp")
 
                     # Track user entries specifically
                     if entry_type == "user":
@@ -402,6 +498,15 @@ def get_session_context(session_id, cwd):
         elif last_type == "user":
             activity = "Thinking"
 
+        # Compute age of last assistant entry (for stale-streaming detection)
+        assistant_age = None
+        if last_assistant_ts and last_assistant_stop is None:
+            try:
+                ts = datetime.fromisoformat(last_assistant_ts.replace("Z", "+00:00"))
+                assistant_age = (datetime.now(timezone.utc) - ts).total_seconds()
+            except (ValueError, TypeError):
+                pass
+
         # Find subagents for this session
         subagents = []
         jsonl_dir = os.path.dirname(jsonl_path)
@@ -434,6 +539,10 @@ def get_session_context(session_id, cwd):
             "msg_count": msg_count,
             "tool_calls": tool_calls,
             "slug": last_slug,
+            "turn_start_ts": turn_start_ts,
+            "last_turn_duration": last_turn_duration,
+            "jsonl_mtime": jsonl_mtime,
+            "last_assistant_age": assistant_age,
         })
     except OSError:
         pass
@@ -559,6 +668,8 @@ def main(stdscr):
         C_SLATE = 23
         C_CREAM = 24
         C_PARCHMENT = 25
+        C_TEAL = 26
+        C_PURPLE = 27
 
         curses.init_color(C_TERRACOTTA, *hex_to_curses(218, 119, 86))
         curses.init_color(C_BEIGE, *hex_to_curses(204, 190, 167))
@@ -570,6 +681,8 @@ def main(stdscr):
         curses.init_color(C_SLATE, *hex_to_curses(148, 163, 184))
         curses.init_color(C_CREAM, *hex_to_curses(251, 240, 223))
         curses.init_color(C_PARCHMENT, *hex_to_curses(246, 222, 206))
+        curses.init_color(C_TEAL, *hex_to_curses(72, 150, 140))
+        curses.init_color(C_PURPLE, *hex_to_curses(175, 135, 255))
 
         curses.init_pair(1, C_EMERALD, -1)       # success/green
         curses.init_pair(2, C_BEIGE, -1)          # secondary text
@@ -585,6 +698,8 @@ def main(stdscr):
         curses.init_pair(12, C_DARK, C_BEIGE)     # bar muted
         curses.init_pair(13, C_PEACH, -1)         # peach accent
         curses.init_pair(14, C_CREAM, -1)         # cream text
+        curses.init_pair(15, C_TEAL, -1)          # plan mode (cyan/teal)
+        curses.init_pair(16, C_PURPLE, -1)        # accept-edits (magenta/purple)
     else:
         # Fallback to standard 8-color terminal
         curses.init_pair(1, curses.COLOR_GREEN, -1)
@@ -601,6 +716,8 @@ def main(stdscr):
         curses.init_pair(12, curses.COLOR_BLACK, curses.COLOR_CYAN)
         curses.init_pair(13, curses.COLOR_YELLOW, -1)
         curses.init_pair(14, curses.COLOR_WHITE, -1)
+        curses.init_pair(15, curses.COLOR_CYAN, -1)
+        curses.init_pair(16, curses.COLOR_MAGENTA, -1)
 
     # Semantic color aliases
     GREEN = curses.color_pair(1) | curses.A_BOLD
@@ -618,12 +735,14 @@ def main(stdscr):
     BAR_MUTED = curses.color_pair(12)
     PEACH = curses.color_pair(13)
     CREAM = curses.color_pair(14)
+    TEAL = curses.color_pair(15)
+    PURPLE = curses.color_pair(16) | curses.A_BOLD
 
     view_mode = VIEW_SESSIONS
     sort_idx_sessions = 0
     sort_idx_procs = 0
     cursor_idx = 0     # highlighted row in current view
-    selected_idx = -1  # -1 = no session expanded
+    selected_pid = -1  # PID of expanded session, -1 = none
     paused = False
 
     # Prime CPU
@@ -643,7 +762,7 @@ def main(stdscr):
         elif key == ord("\t") or key == ord("v") or key == ord("V"):
             view_mode = (view_mode + 1) % 3
             cursor_idx = 0
-            selected_idx = -1
+            selected_pid = -1
         elif key == ord("1"):
             view_mode = VIEW_SESSIONS
             cursor_idx = 0
@@ -673,11 +792,13 @@ def main(stdscr):
         elif key == curses.KEY_HOME:
             cursor_idx = 0
         elif key == ord("\n") or key == ord(" "):
-            if view_mode == VIEW_SESSIONS:
-                if selected_idx == cursor_idx:
-                    selected_idx = -1
+            if view_mode == VIEW_SESSIONS and cached_sessions:
+                clamped = min(cursor_idx, len(cached_sessions) - 1)
+                pid = cached_sessions[clamped].get("pid") if clamped >= 0 else -1
+                if selected_pid == pid:
+                    selected_pid = -1
                 else:
-                    selected_idx = cursor_idx
+                    selected_pid = pid
 
         if paused:
             try:
@@ -712,6 +833,15 @@ def main(stdscr):
         sessions = cached_sessions
         procs = cached_procs
 
+        # Clamp cursor after data refresh so it can't go out-of-bounds
+        if view_mode == VIEW_SESSIONS:
+            cursor_idx = min(cursor_idx, max(0, len(sessions) - 1))
+        elif view_mode == VIEW_PROCESSES:
+            cursor_idx = min(cursor_idx, max(0, len(procs) - 1))
+        elif view_mode == VIEW_HISTORY:
+            daily = stats_cache.get("dailyActivity", [])
+            cursor_idx = min(cursor_idx, max(0, len(daily[-14:]) - 1))
+
         row = 0
 
         # ── Single-row header ──
@@ -740,14 +870,13 @@ def main(stdscr):
             "brand": BRAND, "beige": BEIGE, "amber": AMBER, "red": RED,
             "green": GREEN, "slate": SLATE, "sel": SEL_HDR, "dim": DIM,
             "peach": PEACH, "cream": CREAM,
-            "bar_green": BAR_GREEN, "bar_amber": BAR_AMBER,
-            "bar_red": BAR_RED, "bar_brand": BAR_BRAND, "bar_muted": BAR_MUTED,
+            "teal": TEAL, "purple": PURPLE,
         }
 
         # ── View-specific content ──
         if view_mode == VIEW_SESSIONS:
             row = draw_sessions_view(stdscr, row, h, w, sessions,
-                                     sort_idx_sessions, cursor_idx, selected_idx,
+                                     sort_idx_sessions, cursor_idx, selected_pid,
                                      spin_frame, C)
         elif view_mode == VIEW_PROCESSES:
             row = draw_processes_view(stdscr, row, h, w, procs,
@@ -777,15 +906,24 @@ THINKING_WORDS = [
     "Gallivanting", "Combobulating", "Clauding", "Nebulizing", "Vibing",
 ]
 
+DONE_WORDS = [
+    "Cogitated", "Crunched", "Pondered", "Ruminated", "Brewed",
+    "Simmered", "Composed", "Crafted", "Forged", "Hatched",
+    "Computed", "Percolated", "Synthesized", "Manifested", "Harmonized",
+    "Architected", "Crystallized", "Orchestrated", "Calibrated", "Channeled",
+    "Deliberated", "Noodled", "Contemplated", "Incubated", "Germinated",
+    "Gallivanted", "Combobulated", "Clauded", "Nebulized", "Vibed",
+]
+
 
 def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
-                       selected_idx, spin_frame, C):
+                       selected_pid, spin_frame, C):
     """Draw sessions as single rows; expand stats for selected session."""
     sort_key = SORT_MODES_SESSIONS[sort_idx]
 
     key_fn = {
         "activity": lambda s: (
-            0 if s["activity"] in ACTIVITY_IDLE else 1,  # waiting first
+            1 if s["activity"] in ACTIVITY_IDLE else 0,  # waiting first
             s["context_pct"],
         ),
         "context": lambda s: s["context_pct"],
@@ -816,9 +954,12 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
     proj_w = max(proj_w, 7)  # at least "PROJECT"
 
     # Status word width (fun word or "Waiting")
-    fun_word_w = max(len(THINKING_WORDS[s["pid"] % len(THINKING_WORDS)]) + 3
-                     for s in visible) if visible else 12  # "Word… " + spinner
-    fun_word_w = max(fun_word_w, 9)  # at least "Waiting "
+    fun_word_w = 12
+    if visible:
+        for s in visible:
+            idx = s["pid"] % len(THINKING_WORDS)
+            fun_word_w = max(fun_word_w, len(THINKING_WORDS[idx]) + 3)  # "⠋ Word…"
+            fun_word_w = max(fun_word_w, len(DONE_WORDS[idx % len(DONE_WORDS)]) + 3)  # "✻ Word"
 
     time_w = 8   # "HH:MM:SS"
     out_w = 7    # "999.9M"
@@ -838,6 +979,7 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
 
     bar_w = max(6, int(w * 0.12))
     ctx_label_w = 12  # " 100.5K/1.0M"
+    perm_w = 11  # "⏵⏵ DontAsk" is the widest
     model_w = 12
     slug_w = max((len(s.get("slug", "")) for s in visible), default=0)
 
@@ -846,22 +988,33 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
     col_status = col_proj + proj_w + 1
     col_time = col_status + fun_word_w + 1
     col_out = col_time + time_w + 1
-    col_phase = col_out + out_w + 1
-    col_bar = col_phase + phase_w + 1
+    col_mode = col_out + out_w + 1
+    procs_w = 28  # "1 bash · 2 node · 1 python"
+    col_bar = col_mode + perm_w + 1
     col_after_bar = col_bar + bar_w + ctx_label_w + 1
+    col_procs = col_after_bar
+    col_after_procs = col_procs + procs_w + 1
+    col_phase = col_after_procs
 
-    # Slug + model are optional — only show if room after context
-    show_slug = slug_w > 0 and col_after_bar + slug_w + 2 + model_w < w
-    show_model = col_after_bar + model_w < w
+    # Optional columns — only show if room
+    show_procs = col_procs + procs_w < w
+    show_phase = col_phase + phase_w < w
+    col_after_phase = (col_phase + phase_w + 1) if show_phase else col_after_procs
+    show_slug = slug_w > 0 and col_after_phase + slug_w + 2 + model_w < w
+    show_model = col_after_phase + model_w < w
 
     # ── Column headers ──
     hdr = C["beige"] | curses.A_BOLD
     safe_addstr(stdscr, row, col_proj, "PROJECT", hdr)
     safe_addstr(stdscr, row, col_status, "STATUS", hdr)
-    safe_addstr(stdscr, row, col_time, "TIME", hdr)
+    safe_addstr(stdscr, row, col_time, "TURN", hdr)
     safe_addstr(stdscr, row, col_out, "OUTPUT", hdr)
-    safe_addstr(stdscr, row, col_phase, "PHASE", hdr)
+    safe_addstr(stdscr, row, col_mode, "MODE", hdr)
     safe_addstr(stdscr, row, col_bar, "CONTEXT", hdr)
+    if show_procs:
+        safe_addstr(stdscr, row, col_procs, "PROCS", hdr)
+    if show_phase:
+        safe_addstr(stdscr, row, col_phase, "PHASE", hdr)
     if show_slug:
         safe_addstr(stdscr, row, w - slug_w - 2 - model_w - 1, "SLUG", hdr)
     if show_model:
@@ -876,7 +1029,7 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
 
         session_abs_idx = scroll_top + i
         is_cursor = (session_abs_idx == cursor_idx)
-        is_selected = (session_abs_idx == selected_idx)
+        is_selected = (s.get("pid") == selected_pid)
 
         pct = s["context_pct"]
         ctx_color = C["red"] if pct > 80 else (C["amber"] if pct > 50 else C["green"])
@@ -886,8 +1039,24 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
 
         project = s["project"] or "~"
         model = shorten_model(s["model"])
-        uptime = format_time(s["elapsed"])
         out_tok = format_tokens(s["output_tokens"])
+
+        # Turn time: live elapsed when active, last turn duration when waiting
+        turn_time = ""
+        turn_time_color = C["slate"]
+        if is_active and s.get("turn_start_ts"):
+            try:
+                ts = datetime.fromisoformat(s["turn_start_ts"].replace("Z", "+00:00"))
+                elapsed_s = (datetime.now(timezone.utc) - ts).total_seconds()
+                if elapsed_s >= 0:
+                    turn_time = format_time(elapsed_s)
+                    turn_time_color = C["brand"]
+            except (ValueError, TypeError):
+                pass
+        elif not is_active and s.get("last_turn_duration") is not None:
+            turn_time = format_time(s["last_turn_duration"])
+        if not turn_time:
+            turn_time = format_time(s["elapsed"])  # fallback to session uptime
 
         # ── Cursor indicator ──
         if is_cursor:
@@ -903,19 +1072,28 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
             fun_word = THINKING_WORDS[word_idx]
             safe_addstr(stdscr, row, col_status, f"{spinner} {fun_word}…", C["brand"])
         else:
-            safe_addstr(stdscr, row, col_status, "● Waiting", C["green"])
+            word_idx = s["pid"] % len(DONE_WORDS)
+            safe_addstr(stdscr, row, col_status, f"✻ {DONE_WORDS[word_idx]}", C["slate"])
 
-        # ── Col 3: Time ──
-        safe_addstr(stdscr, row, col_time, uptime, C["slate"])
+        # ── Col 3: Turn time ──
+        safe_addstr(stdscr, row, col_time, turn_time, turn_time_color)
 
         # ── Col 4: Output tokens ──
         safe_addstr(stdscr, row, col_out, out_tok, C["slate"])
 
-        # ── Col 5: Phase ──
-        phase = get_phase(s)
-        if phase:
-            phase_color = C["brand"] if phase == "thinking" else C["amber"]
-            safe_addstr(stdscr, row, col_phase, truncate(phase, phase_w), phase_color)
+        # ── Col 5: Mode (permission mode — icons/colors match Claude Code) ──
+        perm = s.get("permission_mode", "?")
+        perm_info = {
+            "bypassPermissions": ("⏵⏵ Bypass", C["red"]),
+            "dontAsk":           ("⏵⏵ DontAsk", C["red"]),
+            "auto":              ("⏵⏵ Auto", C["amber"]),
+            "acceptEdits":       ("⏵⏵ Accept", C["purple"]),
+            "plan":              ("⏸ Plan", C["teal"]),
+            "default":           ("Default", C["dim"]),
+        }.get(perm)
+        if perm_info:
+            perm_label, perm_color = perm_info
+            safe_addstr(stdscr, row, col_mode, truncate(perm_label, perm_w), perm_color)
 
         # ── Col 6: Context bar (always shown) ──
         if pct < 25:
@@ -930,7 +1108,22 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
         ctx_label = f" {format_tokens(s['total_context'])}/{format_tokens(s['context_max'])}"
         safe_addstr(stdscr, row, col_bar + bar_w, ctx_label, ctx_color)
 
-        # ── Col 7-8: Slug + Model (optional, right-aligned) ──
+        # ── Col 7: Child processes (optional) ──
+        if show_procs:
+            ct = s.get("child_types", {})
+            if ct:
+                parts = [f"{v} {k}" for k, v in sorted(ct.items(), key=lambda x: -x[1])]
+                procs_str = " · ".join(parts)
+                safe_addstr(stdscr, row, col_procs, truncate(procs_str, procs_w), C["teal"])
+
+        # ── Col 8: Phase (optional) ──
+        if show_phase:
+            phase = get_phase(s)
+            if phase:
+                phase_color = C["brand"] if phase == "thinking" else C["amber"]
+                safe_addstr(stdscr, row, col_phase, truncate(phase, phase_w), phase_color)
+
+        # ── Col 8-9: Slug + Model (optional, right-aligned) ──
         if show_slug and slug:
             safe_addstr(stdscr, row, w - slug_w - 2 - model_w - 1, truncate(slug, slug_w), C["dim"])
         if show_model:
@@ -1006,13 +1199,22 @@ def draw_processes_view(stdscr, row, h, w, procs, sort_idx, cursor_idx, C):
     row += 1
 
     avail = h - row - 1
-    visible = procs[cursor_idx: cursor_idx + avail]
+    # Scroll so cursor is always visible
+    scroll_top = 0
+    if cursor_idx >= avail:
+        scroll_top = cursor_idx - avail + 1
+    visible = procs[scroll_top: scroll_top + avail]
 
-    for p in visible:
+    for i, p in enumerate(visible):
         if row >= h - 1:
             break
+        abs_idx = scroll_top + i
+        is_cursor = (abs_idx == cursor_idx)
         ptype = classify_process(p["cmdline"])
         cpu_color = C["red"] if p["cpu"] > 50 else (C["amber"] if p["cpu"] > 10 else C["slate"])
+
+        if is_cursor:
+            safe_addstr(stdscr, row, 0, "▸", C["brand"])
 
         line = (
             f"{p['pid']:>7} "
@@ -1026,8 +1228,8 @@ def draw_processes_view(stdscr, row, h, w, procs, sort_idx, cursor_idx, C):
             f"{format_time(p['elapsed']):>8}  "
             f"{p['cmdline']}"
         )
-        safe_addstr(stdscr, row, 0, truncate(line, w), C["slate"])
-        cpu_pos = 7 + 1 + 7 + 1 + 10 + 1 + 6 + 1 + 4 + 1
+        safe_addstr(stdscr, row, 1, truncate(line, w - 1), C["slate"])
+        cpu_pos = 1 + 7 + 1 + 7 + 1 + 10 + 1 + 6 + 1 + 4 + 1
         safe_addstr(stdscr, row, cpu_pos, f"{p['cpu']:>6.1f}", cpu_color)
         row += 1
 
@@ -1090,28 +1292,40 @@ def draw_history_view(stdscr, row, h, w, stats, cursor_idx, C):
 
     recent = daily[-14:]
     if recent:
-        day_hdr = f"  {'DATE':<12} {'MSGS':>7} {'SESSIONS':>9} {'TOOLS':>7}  {'ACTIVITY'}"
+        day_hdr = f"   {'DATE':<12} {'MSGS':>7} {'SESSIONS':>9} {'TOOLS':>7}  {'ACTIVITY'}"
         safe_addstr(stdscr, row, 0, truncate(day_hdr, w), C["beige"])
         row += 1
 
         max_msgs = max((d.get("messageCount", 0) for d in recent), default=1) or 1
-        bar_area = max(10, w - 42)
+        bar_area = max(10, w - 43)
 
-        start = max(0, len(recent) - (h - row - 1))
-        for d in recent[start:]:
+        avail = h - row - 1
+        scroll_top = 0
+        if cursor_idx >= avail:
+            scroll_top = cursor_idx - avail + 1
+        # Clamp scroll to valid range
+        scroll_top = min(scroll_top, max(0, len(recent) - avail))
+        visible = recent[scroll_top: scroll_top + avail]
+
+        for i, d in enumerate(visible):
             if row >= h - 1:
                 break
+            abs_idx = scroll_top + i
+            is_cursor = (abs_idx == cursor_idx)
             date = d.get("date", "?")
             msgs = d.get("messageCount", 0)
             sess = d.get("sessionCount", 0)
             tools = d.get("toolCallCount", 0)
             bar_len = int(bar_area * msgs / max_msgs) if max_msgs else 0
 
-            safe_addstr(stdscr, row, 2, f"{date:<12}", C["slate"])
-            safe_addstr(stdscr, row, 14, f"{msgs:>7}", C["amber"] if msgs > 2000 else C["slate"])
-            safe_addstr(stdscr, row, 21, f"{sess:>9}", C["slate"])
-            safe_addstr(stdscr, row, 30, f"{tools:>7}", C["slate"])
-            safe_addstr(stdscr, row, 39, "█" * bar_len, C["brand"])
+            if is_cursor:
+                safe_addstr(stdscr, row, 0, " ▸", C["brand"])
+
+            safe_addstr(stdscr, row, 3, f"{date:<12}", C["slate"])
+            safe_addstr(stdscr, row, 15, f"{msgs:>7}", C["amber"] if msgs > 2000 else C["slate"])
+            safe_addstr(stdscr, row, 22, f"{sess:>9}", C["slate"])
+            safe_addstr(stdscr, row, 31, f"{tools:>7}", C["slate"])
+            safe_addstr(stdscr, row, 40, "█" * bar_len, C["brand"])
             row += 1
     else:
         safe_addstr(stdscr, row, 3, "No daily activity data available", C["dim"])
