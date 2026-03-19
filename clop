@@ -419,6 +419,7 @@ def _get_subagents(subagent_dir):
 
         subagents.append({
             "agent_id": agent_id,
+            "_subagent_dir": subagent_dir,
             "type": agent_type,
             "desc": agent_desc,
             "activity": data["activity"],
@@ -1013,6 +1014,14 @@ def main(stdscr):
             cached_sessions = get_active_sessions()
             cached_procs = find_claude_processes()
             last_data_refresh = time.time()
+
+            # Prune stale _subagent_cache entries for exited sessions
+            active_subagent_keys = set()
+            for s in cached_sessions:
+                for a in s.get("subagents", []):
+                    active_subagent_keys.add((a["_subagent_dir"], a["agent_id"]))
+            for stale_key in set(_subagent_cache) - active_subagent_keys:
+                del _subagent_cache[stale_key]
 
             # Auto-expand sessions with active agents (unless user manually collapsed)
             for s in cached_sessions:
