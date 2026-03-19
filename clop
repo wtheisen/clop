@@ -105,6 +105,24 @@ def safe_addstr(stdscr, y, x, text, attr=0):
 
 _proc_cache = {}  # PID → psutil.Process; kept across refreshes for cpu_percent()
 _subagent_cache = {}  # (subagent_dir, agent_id) → (mtime, parsed_data)
+_dir_listing_cache = {}  # dirpath → (mtime, [entries])
+
+
+def _cached_listdir(dirpath):
+    """Return os.listdir(dirpath), cached by directory mtime to reduce I/O."""
+    try:
+        dir_mtime = os.path.getmtime(dirpath)
+    except OSError:
+        return []
+    cached = _dir_listing_cache.get(dirpath)
+    if cached and cached[0] == dir_mtime:
+        return cached[1]
+    try:
+        entries = os.listdir(dirpath)
+    except OSError:
+        entries = []
+    _dir_listing_cache[dirpath] = (dir_mtime, entries)
+    return entries
 
 
 def _parse_jsonl_tail(jsonl_path, read_size=512 * 1024):
@@ -380,7 +398,7 @@ def _get_subagents(subagent_dir):
                 pass
 
         # Check compact files for this agent
-        for f in os.listdir(subagent_dir):
+        for f in _cached_listdir(subagent_dir):
             if f.startswith("agent-acompact-") and f.endswith(".jsonl"):
                 fpath = os.path.join(subagent_dir, f)
                 try:
@@ -571,7 +589,7 @@ def get_session_context(session_id, cwd):
             exact_exists = os.path.exists(exact)
             best_mtime = 0
             newest_path = None
-            for f in os.listdir(candidate_dir):
+            for f in _cached_listdir(candidate_dir):
                 if f.endswith(".jsonl"):
                     fpath = os.path.join(candidate_dir, f)
                     try:
