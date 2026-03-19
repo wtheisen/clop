@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""claude-top: A top-like TUI for monitoring Claude Code sessions and processes."""
+"""clanager: A top-like TUI for managing Claude Code sessions and their subagents."""
 
 import curses
 import json
 import glob
 import time
+import subprocess
 import psutil
 import os
 from datetime import datetime, timezone
@@ -103,120 +104,15 @@ def safe_addstr(stdscr, y, x, text, attr=0):
 
 
 _proc_cache = {}  # PID → psutil.Process; kept across refreshes for cpu_percent()
+_subagent_cache = {}  # (subagent_dir, agent_id) → (mtime, parsed_data)
 
 
-def get_active_sessions():
-    """Get all active Claude Code sessions with their metadata."""
-    sessions = []
-    session_files = glob.glob(str(CLAUDE_DIR / "sessions" / "*.json"))
-    seen_pids = set()
+def _parse_jsonl_tail(jsonl_path, read_size=512 * 1024):
+    """Parse the tail of a JSONL file to extract activity, tokens, and state.
 
-    for sf in session_files:
-        try:
-            pid = int(Path(sf).stem)
-            # Check if process is alive
-            if not psutil.pid_exists(pid):
-                continue
-            seen_pids.add(pid)
-
-            with open(sf) as f:
-                data = json.load(f)
-
-            session_id = data.get("sessionId", "")
-            cwd = data.get("cwd", "")
-            started_at = data.get("startedAt", 0)
-            elapsed = (time.time() * 1000 - started_at) / 1000 if started_at else 0
-
-            # Get process info — reuse cached Process object so
-            # cpu_percent(interval=0) can compare against prior measurement
-            try:
-                if pid not in _proc_cache:
-                    _proc_cache[pid] = psutil.Process(pid)
-                proc = _proc_cache[pid]
-                cpu = proc.cpu_percent(interval=0)
-                mem = proc.memory_info().rss
-                # Count and classify child processes
-                children = proc.children(recursive=True)
-                n_children = len(children)
-                total_mem = mem + sum(c.memory_info().rss for c in children if c.is_running())
-                child_types = {}
-                for c in children:
-                    try:
-                        cname = c.name().lower()
-                        # Normalize common process names
-                        if "bash" in cname:
-                            key = "bash"
-                        elif "zsh" in cname:
-                            key = "zsh"
-                        elif "sh" == cname:
-                            key = "sh"
-                        elif "python" in cname:
-                            key = "python"
-                        elif "node" in cname:
-                            key = "node"
-                        elif "deno" in cname:
-                            key = "deno"
-                        elif "bun" in cname:
-                            key = "bun"
-                        elif "cargo" in cname or "rustc" in cname:
-                            key = "cargo"
-                        elif "go" == cname:
-                            key = "go"
-                        elif "git" in cname:
-                            key = "git"
-                        elif "npm" in cname:
-                            key = "npm"
-                        elif "docker" in cname:
-                            key = "docker"
-                        elif "mcp" in cname:
-                            key = "mcp"
-                        else:
-                            key = cname.split("/")[-1][:10]
-                        child_types[key] = child_types.get(key, 0) + 1
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        pass
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                _proc_cache.pop(pid, None)
-                cpu = 0
-                mem = 0
-                n_children = 0
-                total_mem = 0
-                child_types = {}
-
-            # Find the conversation JSONL for this session
-            ctx_info = get_session_context(session_id, cwd)
-
-            # CPU-based fallback: if JSONL says "Waiting"/"Idle" but process
-            # is using significant CPU, the JSONL hasn't been flushed yet
-            # (streaming in progress). Override to "Active".
-            if ctx_info["activity"] in ("Waiting", "Idle") and cpu > 5.0:
-                ctx_info["activity"] = "Active"
-
-
-            sessions.append({
-                "pid": pid,
-                "session_id": session_id,
-                "cwd": cwd,
-                "project": os.path.basename(cwd) if cwd else "?",
-                "elapsed": elapsed,
-                "cpu": cpu,
-                "mem": total_mem,
-                "children": n_children,
-                "child_types": child_types,
-                **ctx_info,
-            })
-        except (json.JSONDecodeError, ValueError, OSError):
-            continue
-
-    # Evict cached Process objects for PIDs that no longer have sessions
-    for stale_pid in set(_proc_cache) - seen_pids:
-        del _proc_cache[stale_pid]
-
-    return sessions
-
-
-def get_session_context(session_id, cwd):
-    """Extract context window usage from a session's JSONL file."""
+    Shared by both session and subagent parsing.
+    Returns a dict with activity, model, tokens, turn timing, etc.
+    """
     result = {
         "model": "?",
         "input_tokens": 0,
@@ -227,80 +123,20 @@ def get_session_context(session_id, cwd):
         "context_max": DEFAULT_CONTEXT,
         "context_pct": 0,
         "permission_mode": "?",
-        "subagents": [],
         "msg_count": 0,
         "tool_calls": 0,
         "activity": "Idle",
         "slug": "",
         "turn_start_ts": None,
         "last_turn_duration": None,
+        "jsonl_mtime": 0,
+        "last_assistant_age": None,
     }
 
-    if not session_id:
-        return result
-
-    # Find the JSONL file. The session JSON's sessionId can go stale after
-    # context compaction — Claude Code creates new JSONLs with new IDs.
-    # Strategy: compute the project dir from CWD, then find the most
-    # recently modified JSONL there. Fall back to exact session_id match.
-    jsonl_path = None
-    project_dir = None
-
-    if cwd:
-        # Project dir name = CWD with / and _ replaced by -
-        project_dir_name = cwd.replace("/", "-").replace("_", "-")
-        candidate_dir = str(CLAUDE_DIR / "projects" / project_dir_name)
-        if os.path.isdir(candidate_dir):
-            project_dir = candidate_dir
-            # Find both the exact session_id match and the newest JSONL.
-            # After context compaction, Claude Code creates a new JSONL
-            # with a new ID — the session file still has the old ID.
-            # Use exact match if it's fresh; otherwise use newest.
-            exact = os.path.join(candidate_dir, f"{session_id}.jsonl")
-            exact_exists = os.path.exists(exact)
-            best_mtime = 0
-            newest_path = None
-            for f in os.listdir(candidate_dir):
-                if f.endswith(".jsonl"):
-                    fpath = os.path.join(candidate_dir, f)
-                    try:
-                        mt = os.path.getmtime(fpath)
-                        if mt > best_mtime:
-                            best_mtime = mt
-                            newest_path = fpath
-                    except OSError:
-                        pass
-            if exact_exists:
-                try:
-                    exact_mt = os.path.getmtime(exact)
-                except OSError:
-                    exact_mt = 0
-                # If newest is >30s newer than exact, compaction happened
-                if newest_path and best_mtime - exact_mt > 30:
-                    jsonl_path = newest_path
-                else:
-                    jsonl_path = exact
-            elif newest_path:
-                jsonl_path = newest_path
-
-    if not jsonl_path:
-        # Fall back: search all project dirs by exact session_id
-        for pd in glob.glob(str(CLAUDE_DIR / "projects" / "*")):
-            candidate = os.path.join(pd, f"{session_id}.jsonl")
-            if os.path.exists(candidate):
-                jsonl_path = candidate
-                project_dir = pd
-                break
-
-    if not jsonl_path:
-        return result
-
-    # Read the JSONL efficiently — scan from the end for recent usage data
     try:
-        # Read last chunk of file for recent messages
         file_size = os.path.getsize(jsonl_path)
         jsonl_mtime = os.path.getmtime(jsonl_path)
-        read_size = min(file_size, 512 * 1024)  # last 512KB
+        read_size = min(file_size, read_size)
 
         msg_count = 0
         tool_calls = 0
@@ -314,25 +150,21 @@ def get_session_context(session_id, cwd):
         last_type = ""
         last_content_types = []
         last_tool_name = ""
-        # Track assistant state separately: the last assistant entry
-        # with a real stop_reason tells us if the turn finished
-        last_assistant_stop = None  # None = no assistant msg seen, or still streaming
+        last_assistant_stop = None
         last_assistant_ctypes = []
         last_assistant_tool = ""
-        last_assistant_ts = None  # ISO timestamp of the last assistant entry
-        # Sequence tracking for chronological ordering
+        last_assistant_ts = None
         entry_seq = 0
         last_assistant_seq = 0
         last_user_seq = 0
         last_user_ctypes = []
-        last_progress_type = ""  # "agent_progress" if subagent is active
-        turn_ended = False  # set when we see a turn_duration system entry
-        turn_start_ts = None  # ISO timestamp of the user message that started the current turn
-        last_turn_duration = None  # seconds, from turn_duration system entry
+        last_progress_type = ""
+        turn_ended = False
+        turn_start_ts = None
+        last_turn_duration = None
         permission_mode = "?"
 
         with open(jsonl_path, "rb") as f:
-            # Single-pass: read from tail; estimate skipped messages from file size
             f.seek(max(0, file_size - read_size))
             if file_size > read_size:
                 f.readline()  # skip partial line
@@ -349,12 +181,8 @@ def get_session_context(session_id, cwd):
                 if entry.get("slug"):
                     last_slug = entry["slug"]
 
-                # Track entry type BEFORE the message guard — system and
-                # progress entries may lack a "message" dict but still
-                # carry turn_duration / activity signals.
                 entry_type = entry.get("type", "")
 
-                # Detect turn completion from system entries
                 if entry_type == "system" and entry.get("subtype") == "turn_duration":
                     turn_ended = True
                     dur_ms = entry.get("durationMs") or entry.get("duration_ms")
@@ -364,14 +192,13 @@ def get_session_context(session_id, cwd):
                         except (ValueError, TypeError):
                             pass
 
-                # Track progress entries for subagent detection
                 if entry_type == "progress":
                     progress_data_type = entry.get("data", {}).get("type", "")
                     if progress_data_type == "agent_progress":
                         last_progress_type = "agent_progress"
                 elif entry_type in ("assistant", "user"):
                     last_progress_type = ""
-                    turn_ended = False  # new turn started
+                    turn_ended = False
                     if entry_type == "user":
                         ts = entry.get("timestamp")
                         if ts:
@@ -420,21 +247,19 @@ def get_session_context(session_id, cwd):
                                 elif item.get("type") == "tool_result":
                                     last_tool_name = ""
 
-                    # Track assistant entries specifically
                     if entry_type == "assistant":
-                        stop = msg.get("stop_reason")  # None while streaming, str when done
+                        stop = msg.get("stop_reason")
                         last_assistant_ctypes = list(last_content_types)
                         last_assistant_tool = last_tool_name
                         last_assistant_stop = stop
                         last_assistant_seq = entry_seq
                         last_assistant_ts = entry.get("timestamp")
 
-                    # Track user entries specifically
                     if entry_type == "user":
                         last_user_ctypes = list(last_content_types)
                         last_user_seq = entry_seq
 
-        # Estimate messages in the skipped portion of the file
+        # Estimate messages in the skipped portion
         if file_size > read_size and msg_count > 0:
             tail_start = max(0, file_size - read_size)
             bytes_read = file_size - tail_start
@@ -443,10 +268,8 @@ def get_session_context(session_id, cwd):
                 skipped_estimate = int(tail_start / avg_line_size)
                 msg_count += skipped_estimate
 
-        # Estimate current context from the most recent usage
+        # Context estimation
         if last_usage:
-            # The last message's cache_read + cache_creation + input + output
-            # approximates total context consumed
             ctx_tokens = (
                 last_usage.get("cache_read_input_tokens", 0)
                 + last_usage.get("cache_creation_input_tokens", 0)
@@ -459,18 +282,11 @@ def get_session_context(session_id, cwd):
         ctx_max = MODEL_CONTEXT.get(last_model, DEFAULT_CONTEXT) if last_model else DEFAULT_CONTEXT
         ctx_pct = (ctx_tokens / ctx_max * 100) if ctx_max else 0
 
-        # Derive activity status from last message state
-        # "Waiting" strictly means the session needs user keyboard input.
-        # Everything else gets an active status describing what's happening.
+        # Activity derivation
         activity = "Idle"
-
-        # turn_duration system entry is the most reliable signal that a
-        # turn finished — Claude Code doesn't always rewrite the assistant
-        # entry with a final stop_reason.
         if turn_ended:
             activity = "Waiting"
         elif last_progress_type == "agent_progress":
-            # Subagent is actively running
             activity = "Running Agent"
         elif last_type == "assistant":
             if last_assistant_stop is not None:
@@ -485,7 +301,6 @@ def get_session_context(session_id, cwd):
                 else:
                     activity = "Waiting"
             else:
-                # stop_reason is None → still streaming
                 if "thinking" in last_assistant_ctypes:
                     activity = "Thinking"
                 elif any(ct.startswith("tool_use") for ct in last_assistant_ctypes):
@@ -498,7 +313,7 @@ def get_session_context(session_id, cwd):
         elif last_type == "user":
             activity = "Thinking"
 
-        # Compute age of last assistant entry (for stale-streaming detection)
+        # Assistant age for stale detection
         assistant_age = None
         if last_assistant_ts and last_assistant_stop is None:
             try:
@@ -507,27 +322,9 @@ def get_session_context(session_id, cwd):
             except (ValueError, TypeError):
                 pass
 
-        # Find subagents for this session
-        subagents = []
-        jsonl_dir = os.path.dirname(jsonl_path)
-        jsonl_session_id = os.path.basename(jsonl_path).replace(".jsonl", "")
-        subagent_dir = os.path.join(jsonl_dir, jsonl_session_id, "subagents")
-        if os.path.isdir(subagent_dir):
-            for meta_file in glob.glob(os.path.join(subagent_dir, "*.meta.json")):
-                try:
-                    with open(meta_file) as mf:
-                        meta = json.load(mf)
-                    subagents.append({
-                        "type": meta.get("agentType", "?"),
-                        "desc": meta.get("description", ""),
-                    })
-                except (OSError, json.JSONDecodeError):
-                    pass
-
         result.update({
             "activity": activity,
             "permission_mode": permission_mode,
-            "subagents": subagents,
             "model": last_model or "?",
             "input_tokens": total_input,
             "output_tokens": total_output,
@@ -547,6 +344,276 @@ def get_session_context(session_id, cwd):
     except OSError:
         pass
 
+    return result
+
+
+def _get_subagents(subagent_dir):
+    """Parse all subagents in a directory, using cache for unchanged files."""
+    subagents = []
+    if not os.path.isdir(subagent_dir):
+        return subagents
+
+    for meta_file in glob.glob(os.path.join(subagent_dir, "*.meta.json")):
+        try:
+            with open(meta_file) as mf:
+                meta = json.load(mf)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        agent_type = meta.get("agentType", "?")
+        agent_desc = meta.get("description", "")
+
+        # Derive agent ID from meta filename: agent-XXXX.meta.json -> agent-XXXX
+        base = os.path.basename(meta_file).replace(".meta.json", "")
+        agent_id = base  # e.g. "agent-a567a531a9219a6c2"
+
+        # Find the best JSONL for this agent
+        primary_jsonl = os.path.join(subagent_dir, f"{agent_id}.jsonl")
+        best_path = None
+        best_mtime = 0
+
+        if os.path.exists(primary_jsonl):
+            try:
+                best_mtime = os.path.getmtime(primary_jsonl)
+                best_path = primary_jsonl
+            except OSError:
+                pass
+
+        # Check compact files for this agent
+        for f in os.listdir(subagent_dir):
+            if f.startswith("agent-acompact-") and f.endswith(".jsonl"):
+                fpath = os.path.join(subagent_dir, f)
+                try:
+                    mt = os.path.getmtime(fpath)
+                    if mt > best_mtime:
+                        best_mtime = mt
+                        best_path = fpath
+                except OSError:
+                    pass
+
+        if not best_path:
+            # No JSONL — just return meta info with defaults
+            subagents.append({
+                "agent_id": agent_id,
+                "type": agent_type,
+                "desc": agent_desc,
+                "activity": "Idle",
+                "total_context": 0,
+                "context_max": DEFAULT_CONTEXT,
+                "context_pct": 0,
+                "model": "?",
+                "output_tokens": 0,
+                "turn_start_ts": None,
+                "last_turn_duration": None,
+            })
+            continue
+
+        # Check cache
+        cache_key = (subagent_dir, agent_id)
+        cached = _subagent_cache.get(cache_key)
+        if cached and cached[0] == best_mtime:
+            data = cached[1]
+        else:
+            data = _parse_jsonl_tail(best_path, read_size=128 * 1024)
+            _subagent_cache[cache_key] = (best_mtime, data)
+
+        subagents.append({
+            "agent_id": agent_id,
+            "type": agent_type,
+            "desc": agent_desc,
+            "activity": data["activity"],
+            "total_context": data["total_context"],
+            "context_max": data["context_max"],
+            "context_pct": data["context_pct"],
+            "model": data["model"],
+            "output_tokens": data["output_tokens"],
+            "turn_start_ts": data["turn_start_ts"],
+            "last_turn_duration": data["last_turn_duration"],
+        })
+
+    return subagents
+
+
+def get_active_sessions():
+    """Get all active Claude Code sessions with their metadata."""
+    sessions = []
+    session_files = glob.glob(str(CLAUDE_DIR / "sessions" / "*.json"))
+    seen_pids = set()
+
+    for sf in session_files:
+        try:
+            pid = int(Path(sf).stem)
+            if not psutil.pid_exists(pid):
+                continue
+            seen_pids.add(pid)
+
+            with open(sf) as f:
+                data = json.load(f)
+
+            session_id = data.get("sessionId", "")
+            cwd = data.get("cwd", "")
+            started_at = data.get("startedAt", 0)
+            elapsed = (time.time() * 1000 - started_at) / 1000 if started_at else 0
+
+            try:
+                if pid not in _proc_cache:
+                    _proc_cache[pid] = psutil.Process(pid)
+                proc = _proc_cache[pid]
+                cpu = proc.cpu_percent(interval=0)
+                mem = proc.memory_info().rss
+                children = proc.children(recursive=True)
+                n_children = len(children)
+                total_mem = mem + sum(c.memory_info().rss for c in children if c.is_running())
+                child_types = {}
+                for c in children:
+                    try:
+                        cname = c.name().lower()
+                        if "bash" in cname:
+                            key = "bash"
+                        elif "zsh" in cname:
+                            key = "zsh"
+                        elif "sh" == cname:
+                            key = "sh"
+                        elif "python" in cname:
+                            key = "python"
+                        elif "node" in cname:
+                            key = "node"
+                        elif "deno" in cname:
+                            key = "deno"
+                        elif "bun" in cname:
+                            key = "bun"
+                        elif "cargo" in cname or "rustc" in cname:
+                            key = "cargo"
+                        elif "go" == cname:
+                            key = "go"
+                        elif "git" in cname:
+                            key = "git"
+                        elif "npm" in cname:
+                            key = "npm"
+                        elif "docker" in cname:
+                            key = "docker"
+                        elif "mcp" in cname:
+                            key = "mcp"
+                        else:
+                            key = cname.split("/")[-1][:10]
+                        child_types[key] = child_types.get(key, 0) + 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                _proc_cache.pop(pid, None)
+                cpu = 0
+                mem = 0
+                n_children = 0
+                total_mem = 0
+                child_types = {}
+
+            ctx_info = get_session_context(session_id, cwd)
+
+            if ctx_info["activity"] in ("Waiting", "Idle") and cpu > 5.0:
+                ctx_info["activity"] = "Active"
+
+            sessions.append({
+                "pid": pid,
+                "session_id": session_id,
+                "cwd": cwd,
+                "project": os.path.basename(cwd) if cwd else "?",
+                "elapsed": elapsed,
+                "cpu": cpu,
+                "mem": total_mem,
+                "children": n_children,
+                "child_types": child_types,
+                **ctx_info,
+            })
+        except (json.JSONDecodeError, ValueError, OSError):
+            continue
+
+    for stale_pid in set(_proc_cache) - seen_pids:
+        del _proc_cache[stale_pid]
+
+    return sessions
+
+
+def get_session_context(session_id, cwd):
+    """Extract context window usage from a session's JSONL file."""
+    result = {
+        "model": "?",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "total_context": 0,
+        "context_max": DEFAULT_CONTEXT,
+        "context_pct": 0,
+        "permission_mode": "?",
+        "subagents": [],
+        "msg_count": 0,
+        "tool_calls": 0,
+        "activity": "Idle",
+        "slug": "",
+        "turn_start_ts": None,
+        "last_turn_duration": None,
+    }
+
+    if not session_id:
+        return result
+
+    # Find the JSONL file
+    jsonl_path = None
+    project_dir = None
+
+    if cwd:
+        project_dir_name = cwd.replace("/", "-").replace("_", "-")
+        candidate_dir = str(CLAUDE_DIR / "projects" / project_dir_name)
+        if os.path.isdir(candidate_dir):
+            project_dir = candidate_dir
+            exact = os.path.join(candidate_dir, f"{session_id}.jsonl")
+            exact_exists = os.path.exists(exact)
+            best_mtime = 0
+            newest_path = None
+            for f in os.listdir(candidate_dir):
+                if f.endswith(".jsonl"):
+                    fpath = os.path.join(candidate_dir, f)
+                    try:
+                        mt = os.path.getmtime(fpath)
+                        if mt > best_mtime:
+                            best_mtime = mt
+                            newest_path = fpath
+                    except OSError:
+                        pass
+            if exact_exists:
+                try:
+                    exact_mt = os.path.getmtime(exact)
+                except OSError:
+                    exact_mt = 0
+                if newest_path and best_mtime - exact_mt > 30:
+                    jsonl_path = newest_path
+                else:
+                    jsonl_path = exact
+            elif newest_path:
+                jsonl_path = newest_path
+
+    if not jsonl_path:
+        for pd in glob.glob(str(CLAUDE_DIR / "projects" / "*")):
+            candidate = os.path.join(pd, f"{session_id}.jsonl")
+            if os.path.exists(candidate):
+                jsonl_path = candidate
+                project_dir = pd
+                break
+
+    if not jsonl_path:
+        return result
+
+    # Parse the JSONL
+    parsed = _parse_jsonl_tail(jsonl_path)
+
+    # Find subagents
+    jsonl_dir = os.path.dirname(jsonl_path)
+    jsonl_session_id = os.path.basename(jsonl_path).replace(".jsonl", "")
+    subagent_dir = os.path.join(jsonl_dir, jsonl_session_id, "subagents")
+    subagents = _get_subagents(subagent_dir)
+
+    result.update(parsed)
+    result["subagents"] = subagents
     return result
 
 
@@ -628,9 +695,104 @@ def shorten_model(model):
         return "haiku-4.5"
     if "haiku" in m:
         return "haiku"
-    # Fallback: last meaningful part
     parts = model.split("-")
     return "-".join(parts[:3]) if len(parts) > 3 else model
+
+
+def jump_to_tmux(session_pid):
+    """Jump to the tmux window containing the given session PID."""
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{session_name}:#{window_index} #{pane_pid}"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode != 0:
+            return False
+
+        pane_map = {}
+        for line in result.stdout.strip().split("\n"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    pane_map[int(parts[1])] = parts[0]
+                except ValueError:
+                    pass
+
+        # Walk up from session_pid to find a tmux pane ancestor
+        try:
+            current = psutil.Process(session_pid)
+            while current:
+                if current.pid in pane_map:
+                    target = pane_map[current.pid]
+                    subprocess.run(
+                        ["tmux", "select-window", "-t", target],
+                        capture_output=True, timeout=2
+                    )
+                    return True
+                try:
+                    current = current.parent()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+        # Fallback: check if session_pid is a descendant of any pane
+        for pane_pid, window in pane_map.items():
+            try:
+                pane_proc = psutil.Process(pane_pid)
+                descendants = {c.pid for c in pane_proc.children(recursive=True)}
+                if session_pid in descendants:
+                    subprocess.run(
+                        ["tmux", "select-window", "-t", window],
+                        capture_output=True, timeout=2
+                    )
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        return False
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def build_display_rows(sessions, collapsed_pids):
+    """Build a flat list of display rows from sessions + their subagents.
+
+    Each row is a tuple:
+      ("session", session_dict, session_index)
+      ("agent", agent_dict, parent_session_dict, is_last_agent)
+      ("separator",)
+    """
+    rows = []
+    for si, s in enumerate(sessions):
+        pid = s["pid"]
+        subagents = s.get("subagents", [])
+        n_active = sum(1 for a in subagents if a.get("activity") not in ACTIVITY_IDLE)
+        s["_n_active_agents"] = n_active
+        s["_n_total_agents"] = len(subagents)
+
+        rows.append(("session", s, si))
+
+        if pid not in collapsed_pids and subagents:
+            for j, agent in enumerate(subagents):
+                is_last = (j == len(subagents) - 1)
+                rows.append(("agent", agent, s, is_last))
+
+        rows.append(("separator",))
+    return rows
+
+
+def get_cursor_session(display_rows, cursor_idx):
+    """Get the parent session dict for the row at cursor_idx."""
+    if cursor_idx < 0 or cursor_idx >= len(display_rows):
+        return None
+    row = display_rows[cursor_idx]
+    if row[0] == "session":
+        return row[1]
+    elif row[0] == "agent":
+        return row[2]  # parent session
+    return None
 
 
 def main(stdscr):
@@ -641,20 +803,9 @@ def main(stdscr):
     curses.start_color()
     curses.use_default_colors()
 
-    # ── Anthropic brand palette (true color where supported) ──
-    # #da7756 = terracotta (primary brand)    rgb(218, 119, 86)
-    # #ccbea7 = warm beige (secondary)        rgb(204, 190, 167)
-    # #f3d5a3 = light peach (accent)          rgb(243, 213, 163)
-    # #e39437 = amber (warning/highlight)     rgb(227, 148, 55)
-    # #1a1a1a = near-black (bg)               rgb(26, 26, 26)
-    # #10b981 = emerald (success)             rgb(16, 185, 129)
-    # #dc2626 = red (error/high)              rgb(220, 38, 38)
-    # #94a3b8 = slate (muted text)            rgb(148, 163, 184)
-
     has_custom_colors = curses.can_change_color() and curses.COLORS >= 256
 
     if has_custom_colors:
-        # Define custom colors (curses uses 0-1000 range for RGB)
         def hex_to_curses(r, g, b):
             return int(r / 255 * 1000), int(g / 255 * 1000), int(b / 255 * 1000)
 
@@ -684,30 +835,29 @@ def main(stdscr):
         curses.init_color(C_TEAL, *hex_to_curses(72, 150, 140))
         curses.init_color(C_PURPLE, *hex_to_curses(175, 135, 255))
 
-        curses.init_pair(1, C_EMERALD, -1)       # success/green
-        curses.init_pair(2, C_BEIGE, -1)          # secondary text
-        curses.init_pair(3, C_AMBER, -1)          # warning/highlight
-        curses.init_pair(4, C_CRIMSON, -1)        # error/high
-        curses.init_pair(5, C_SLATE, -1)          # normal/muted
-        curses.init_pair(6, C_TERRACOTTA, -1)     # brand primary
-        curses.init_pair(7, C_CREAM, C_TERRACOTTA)  # selected header
-        curses.init_pair(8, C_DARK, C_EMERALD)    # bar green
-        curses.init_pair(9, C_DARK, C_AMBER)      # bar yellow/amber
-        curses.init_pair(10, C_DARK, C_CRIMSON)   # bar red
-        curses.init_pair(11, C_DARK, C_TERRACOTTA)  # bar brand
-        curses.init_pair(12, C_DARK, C_BEIGE)     # bar muted
-        curses.init_pair(13, C_PEACH, -1)         # peach accent
-        curses.init_pair(14, C_CREAM, -1)         # cream text
-        curses.init_pair(15, C_TEAL, -1)          # plan mode (cyan/teal)
-        curses.init_pair(16, C_PURPLE, -1)        # accept-edits (magenta/purple)
+        curses.init_pair(1, C_EMERALD, -1)
+        curses.init_pair(2, C_BEIGE, -1)
+        curses.init_pair(3, C_AMBER, -1)
+        curses.init_pair(4, C_CRIMSON, -1)
+        curses.init_pair(5, C_SLATE, -1)
+        curses.init_pair(6, C_TERRACOTTA, -1)
+        curses.init_pair(7, C_CREAM, C_TERRACOTTA)
+        curses.init_pair(8, C_DARK, C_EMERALD)
+        curses.init_pair(9, C_DARK, C_AMBER)
+        curses.init_pair(10, C_DARK, C_CRIMSON)
+        curses.init_pair(11, C_DARK, C_TERRACOTTA)
+        curses.init_pair(12, C_DARK, C_BEIGE)
+        curses.init_pair(13, C_PEACH, -1)
+        curses.init_pair(14, C_CREAM, -1)
+        curses.init_pair(15, C_TEAL, -1)
+        curses.init_pair(16, C_PURPLE, -1)
     else:
-        # Fallback to standard 8-color terminal
         curses.init_pair(1, curses.COLOR_GREEN, -1)
         curses.init_pair(2, curses.COLOR_CYAN, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_RED, -1)
         curses.init_pair(5, curses.COLOR_WHITE, -1)
-        curses.init_pair(6, curses.COLOR_YELLOW, -1)   # closest to terracotta
+        curses.init_pair(6, curses.COLOR_YELLOW, -1)
         curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_RED)
         curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_GREEN)
         curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_YELLOW)
@@ -719,13 +869,12 @@ def main(stdscr):
         curses.init_pair(15, curses.COLOR_CYAN, -1)
         curses.init_pair(16, curses.COLOR_MAGENTA, -1)
 
-    # Semantic color aliases
     GREEN = curses.color_pair(1) | curses.A_BOLD
     BEIGE = curses.color_pair(2)
     AMBER = curses.color_pair(3)
     RED = curses.color_pair(4) | curses.A_BOLD
     SLATE = curses.color_pair(5)
-    BRAND = curses.color_pair(6) | curses.A_BOLD   # terracotta
+    BRAND = curses.color_pair(6) | curses.A_BOLD
     SEL_HDR = curses.color_pair(7) | curses.A_BOLD
     DIM = curses.color_pair(5) | curses.A_DIM
     BAR_GREEN = curses.color_pair(8)
@@ -741,19 +890,23 @@ def main(stdscr):
     view_mode = VIEW_SESSIONS
     sort_idx_sessions = 0
     sort_idx_procs = 0
-    cursor_idx = 0     # highlighted row in current view
-    selected_pid = -1  # PID of expanded session, -1 = none
+    cursor_idx = 0
+    selected_pid = -1  # PID of expanded session detail, -1 = none
+    collapsed_pids = set()  # PIDs whose agent trees are collapsed
+    manually_toggled = set()  # PIDs the user explicitly toggled
     paused = False
 
     # Prime CPU
     find_claude_processes()
     stats_cache = get_stats_cache()
     last_stats_refresh = time.time()
-    last_data_refresh = 0  # force immediate data load
+    last_data_refresh = 0
     cached_sessions = []
     cached_procs = []
+    cached_display_rows = []
     spin_frame = 0
-    DATA_REFRESH_INTERVAL = 2.0  # read files every 2s, render every 0.5s
+    DATA_REFRESH_INTERVAL = 2.0
+    jump_flash = 0  # countdown frames for tmux jump feedback
 
     while True:
         key = stdscr.getch()
@@ -779,26 +932,58 @@ def main(stdscr):
                 sort_idx_procs = (sort_idx_procs + 1) % len(SORT_MODES_PROCS)
         elif key == ord("p") or key == ord("P"):
             paused = not paused
+        elif key == ord("g") or key == ord("G"):
+            if view_mode == VIEW_SESSIONS and cached_display_rows:
+                sess = get_cursor_session(cached_display_rows, cursor_idx)
+                if sess:
+                    if jump_to_tmux(sess["pid"]):
+                        jump_flash = 15  # show feedback for ~1.2s
         elif key == curses.KEY_UP:
-            cursor_idx = max(0, cursor_idx - 1)
+            if view_mode == VIEW_SESSIONS and cached_display_rows:
+                # Skip separator rows
+                new_idx = cursor_idx - 1
+                while new_idx >= 0 and cached_display_rows[new_idx][0] == "separator":
+                    new_idx -= 1
+                cursor_idx = max(0, new_idx)
+            else:
+                cursor_idx = max(0, cursor_idx - 1)
         elif key == curses.KEY_DOWN:
-            if view_mode == VIEW_SESSIONS:
-                max_items = len(cached_sessions)
+            if view_mode == VIEW_SESSIONS and cached_display_rows:
+                new_idx = cursor_idx + 1
+                while new_idx < len(cached_display_rows) and cached_display_rows[new_idx][0] == "separator":
+                    new_idx += 1
+                if new_idx < len(cached_display_rows):
+                    cursor_idx = new_idx
             elif view_mode == VIEW_PROCESSES:
-                max_items = len(cached_procs)
+                cursor_idx = min(cursor_idx + 1, max(0, len(cached_procs) - 1))
             else:
                 max_items = len(stats_cache.get("dailyActivity", []))
-            cursor_idx = min(cursor_idx + 1, max(0, max_items - 1))
+                cursor_idx = min(cursor_idx + 1, max(0, max_items - 1))
         elif key == curses.KEY_HOME:
             cursor_idx = 0
         elif key == ord("\n") or key == ord(" "):
-            if view_mode == VIEW_SESSIONS and cached_sessions:
-                clamped = min(cursor_idx, len(cached_sessions) - 1)
-                pid = cached_sessions[clamped].get("pid") if clamped >= 0 else -1
-                if selected_pid == pid:
-                    selected_pid = -1
-                else:
-                    selected_pid = pid
+            if view_mode == VIEW_SESSIONS and cached_display_rows:
+                if cursor_idx < len(cached_display_rows):
+                    row_data = cached_display_rows[cursor_idx]
+                    if row_data[0] == "session":
+                        sess = row_data[1]
+                        pid = sess["pid"]
+                        # Toggle collapse/expand of subagent tree
+                        if pid in collapsed_pids:
+                            collapsed_pids.discard(pid)
+                        else:
+                            collapsed_pids.add(pid)
+                        manually_toggled.add(pid)
+                        # Rebuild display rows immediately
+                        cached_display_rows = build_display_rows(cached_sessions, collapsed_pids)
+                    elif row_data[0] == "agent":
+                        # Toggle detail view for parent session
+                        parent = row_data[2]
+                        pid = parent["pid"]
+                        if selected_pid == pid:
+                            selected_pid = -1
+                        else:
+                            selected_pid = pid
 
         if paused:
             try:
@@ -818,42 +1003,42 @@ def main(stdscr):
             stdscr.refresh()
             continue
 
-        # Refresh stats cache every 30s
         if time.time() - last_stats_refresh > 30:
             stats_cache = get_stats_cache()
             last_stats_refresh = time.time()
 
         now = datetime.now().strftime("%H:%M:%S")
 
-        # Throttle expensive data reads, but render every frame for spinner
         if time.time() - last_data_refresh >= DATA_REFRESH_INTERVAL:
             cached_sessions = get_active_sessions()
             cached_procs = find_claude_processes()
             last_data_refresh = time.time()
+
+            # Auto-expand sessions with active agents (unless user manually collapsed)
+            for s in cached_sessions:
+                pid = s["pid"]
+                if pid not in manually_toggled:
+                    n_active = sum(1 for a in s.get("subagents", [])
+                                   if a.get("activity") not in ACTIVITY_IDLE)
+                    if n_active > 0:
+                        collapsed_pids.discard(pid)
+
         sessions = cached_sessions
         procs = cached_procs
-
-        # Clamp cursor after data refresh so it can't go out-of-bounds
-        if view_mode == VIEW_SESSIONS:
-            cursor_idx = min(cursor_idx, max(0, len(sessions) - 1))
-        elif view_mode == VIEW_PROCESSES:
-            cursor_idx = min(cursor_idx, max(0, len(procs) - 1))
-        elif view_mode == VIEW_HISTORY:
-            daily = stats_cache.get("dailyActivity", [])
-            cursor_idx = min(cursor_idx, max(0, len(daily[-14:]) - 1))
 
         row = 0
 
         # ── Single-row header ──
         n_sessions = len(sessions)
         n_procs = len(procs)
+        total_agents = sum(len(s.get("subagents", [])) for s in sessions)
         total_cpu = sum(p["cpu"] for p in procs)
         total_mem = sum(p["mem_rss"] for p in procs)
 
         view_label = VIEW_NAMES[view_mode]
-        title = f" clop [{view_label}]"
+        title = f" clanager [{view_label}]"
         stats_right = (
-            f"{n_sessions} sess  {n_procs} proc  "
+            f"{n_sessions} sess  {total_agents} agents  {n_procs} proc  "
             f"CPU {total_cpu:.0f}%  MEM {format_bytes(total_mem).strip()}  "
             f"{now} "
         )
@@ -863,9 +1048,15 @@ def main(stdscr):
         safe_addstr(stdscr, row, max(0, w - len(stats_right)), stats_right, SEL_HDR)
         row += 1
 
+        # Jump flash feedback
+        if jump_flash > 0:
+            jump_flash -= 1
+            flash_msg = " → jumped to tmux tab "
+            safe_addstr(stdscr, row, max(0, (w - len(flash_msg)) // 2), flash_msg, GREEN)
+            row += 1
+
         spin_frame += 1
 
-        # Pack colors into a dict so we don't pass 15 positional args
         C = {
             "brand": BRAND, "beige": BEIGE, "amber": AMBER, "red": RED,
             "green": GREEN, "slate": SLATE, "sel": SEL_HDR, "dim": DIM,
@@ -873,20 +1064,33 @@ def main(stdscr):
             "teal": TEAL, "purple": PURPLE,
         }
 
-        # ── View-specific content ──
         if view_mode == VIEW_SESSIONS:
             row = draw_sessions_view(stdscr, row, h, w, sessions,
                                      sort_idx_sessions, cursor_idx, selected_pid,
-                                     spin_frame, C)
+                                     collapsed_pids, spin_frame, C)
+            # Rebuild display rows for cursor navigation
+            cached_display_rows = build_display_rows(sessions, collapsed_pids)
+            # Clamp cursor
+            if cached_display_rows:
+                max_idx = len(cached_display_rows) - 1
+                cursor_idx = min(cursor_idx, max_idx)
+                # Skip separator if cursor landed on one
+                while cursor_idx > 0 and cached_display_rows[cursor_idx][0] == "separator":
+                    cursor_idx -= 1
+            else:
+                cursor_idx = 0
         elif view_mode == VIEW_PROCESSES:
+            cursor_idx = min(cursor_idx, max(0, len(procs) - 1))
             row = draw_processes_view(stdscr, row, h, w, procs,
                                       sort_idx_procs, cursor_idx, C)
         elif view_mode == VIEW_HISTORY:
+            daily = stats_cache.get("dailyActivity", [])
+            cursor_idx = min(cursor_idx, max(0, len(daily[-14:]) - 1))
             row = draw_history_view(stdscr, row, h, w, stats_cache,
                                     cursor_idx, C)
 
         # ── Footer ──
-        footer = " q:Quit  Tab/v:View  s:Sort  p:Pause  1-3:View  ↑↓:Scroll  Enter:Details "
+        footer = " q:Quit  Tab/v:View  s:Sort  g:Jump  Enter:Expand  p:Pause  ↑↓:Nav "
         safe_addstr(stdscr, h - 1, 0, " " * w, SEL_HDR)
         safe_addstr(stdscr, h - 1, 1, truncate(footer, w - 2), SEL_HDR)
 
@@ -896,7 +1100,6 @@ def main(stdscr):
 SPINNER_FRAMES = ["✶", "✸", "✹", "✺", "✹", "✸"]
 ACTIVITY_IDLE = {"Idle", "Waiting"}
 
-# Claude Code's fun status words (sampled from the real list)
 THINKING_WORDS = [
     "Thinking", "Computing", "Pondering", "Ruminating", "Cogitating",
     "Contemplating", "Deliberating", "Noodling", "Percolating", "Brewing",
@@ -917,13 +1120,13 @@ DONE_WORDS = [
 
 
 def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
-                       selected_pid, spin_frame, C):
-    """Draw sessions as single rows; expand stats for selected session."""
+                       selected_pid, collapsed_pids, spin_frame, C):
+    """Draw sessions with tree-view subagents."""
     sort_key = SORT_MODES_SESSIONS[sort_idx]
 
     key_fn = {
         "activity": lambda s: (
-            1 if s["activity"] in ACTIVITY_IDLE else 0,  # waiting first
+            1 if s["activity"] in ACTIVITY_IDLE else 0,
             s["context_pct"],
         ),
         "context": lambda s: s["context_pct"],
@@ -940,31 +1143,33 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
         safe_addstr(stdscr, row, max(0, (w - 28) // 2), "Start one with: claude", C["dim"])
         return row + 1
 
-    avail = h - row - 1 - 2  # subtract 2 for column header + separator
-    # Each session takes 2 rows (content + separator), selected takes more
-    max_visible = max(1, avail // 2)
-    # Auto-scroll so cursor is always visible
+    # Build flat display rows
+    display_rows = build_display_rows(sessions, collapsed_pids)
+
+    avail = h - row - 1 - 2  # header + separator line
+
+    # Find scroll position to keep cursor visible
     scroll_top = 0
-    if cursor_idx >= max_visible:
-        scroll_top = cursor_idx - max_visible + 1
-    visible = sessions[scroll_top: scroll_top + max_visible]
+    if cursor_idx >= avail + scroll_top:
+        scroll_top = cursor_idx - avail + 1
+    scroll_top = max(0, min(scroll_top, len(display_rows) - avail))
 
-    # ── Compute fixed column widths from all visible data ──
-    proj_w = max((len(s["project"] or "~") for s in visible), default=4)
-    proj_w = max(proj_w, 7)  # at least "PROJECT"
+    visible_rows = display_rows[scroll_top: scroll_top + avail]
 
-    # Status word width (fun word or "Waiting")
-    fun_word_w = 12
-    if visible:
-        for s in visible:
-            idx = s["pid"] % len(THINKING_WORDS)
-            fun_word_w = max(fun_word_w, len(THINKING_WORDS[idx]) + 3)  # "⠋ Word…"
-            fun_word_w = max(fun_word_w, len(DONE_WORDS[idx % len(DONE_WORDS)]) + 3)  # "✻ Word"
+    # ── Compute column widths from visible sessions ──
+    visible_sessions = [r[1] for r in visible_rows if r[0] == "session"]
+    if not visible_sessions:
+        visible_sessions = sessions[:1]
 
-    time_w = 8   # "HH:MM:SS"
-    out_w = 7    # "999.9M"
+    proj_w = max((len(s["project"] or "~") for s in visible_sessions), default=4)
+    proj_w = max(proj_w, 7)
 
-    # Phase: derive for width calc
+    fun_word_w = 14
+    for s in visible_sessions:
+        idx = s["pid"] % len(THINKING_WORDS)
+        fun_word_w = max(fun_word_w, len(THINKING_WORDS[idx]) + 3)
+        fun_word_w = max(fun_word_w, len(DONE_WORDS[idx % len(DONE_WORDS)]) + 3)
+
     def get_phase(s):
         activity = s.get("activity", "Idle")
         if activity in ACTIVITY_IDLE:
@@ -975,32 +1180,29 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
             return (activity.split(" ", 1)[1] if " " in activity else "tool").lower()
         return "thinking"
 
-    phase_w = 24  # fixed width — long MCP tool names get truncated
-
+    time_w = 8
+    out_w = 7
+    phase_w = 24
     bar_w = max(6, int(w * 0.12))
-    ctx_label_w = 12  # " 100.5K/1.0M"
-    perm_w = 11  # "⏵⏵ DontAsk" is the widest
+    ctx_label_w = 12
+    perm_w = 11
     model_w = 12
-    slug_w = max((len(s.get("slug", "")) for s in visible), default=0)
+    agents_w = 14  # "3/5 active"
 
-    # Fixed column positions (col 0 reserved for cursor indicator)
     col_proj = 2
     col_status = col_proj + proj_w + 1
     col_time = col_status + fun_word_w + 1
     col_out = col_time + time_w + 1
     col_mode = col_out + out_w + 1
-    procs_w = 28  # "1 bash · 2 node · 1 python"
     col_bar = col_mode + perm_w + 1
     col_after_bar = col_bar + bar_w + ctx_label_w + 1
-    col_procs = col_after_bar
-    col_after_procs = col_procs + procs_w + 1
-    col_phase = col_after_procs
+    col_agents = col_after_bar
+    col_after_agents = col_agents + agents_w + 1
+    col_phase = col_after_agents
 
-    # Optional columns — only show if room
-    show_procs = col_procs + procs_w < w
+    show_agents = col_agents + agents_w < w
     show_phase = col_phase + phase_w < w
-    col_after_phase = (col_phase + phase_w + 1) if show_phase else col_after_procs
-    show_slug = slug_w > 0 and col_after_phase + slug_w + 2 + model_w < w
+    col_after_phase = (col_phase + phase_w + 1) if show_phase else col_after_agents
     show_model = col_after_phase + model_w < w
 
     # ── Column headers ──
@@ -1011,163 +1213,231 @@ def draw_sessions_view(stdscr, row, h, w, sessions, sort_idx, cursor_idx,
     safe_addstr(stdscr, row, col_out, "OUTPUT", hdr)
     safe_addstr(stdscr, row, col_mode, "MODE", hdr)
     safe_addstr(stdscr, row, col_bar, "CONTEXT", hdr)
-    if show_procs:
-        safe_addstr(stdscr, row, col_procs, "PROCS", hdr)
+    if show_agents:
+        safe_addstr(stdscr, row, col_agents, "AGENTS", hdr)
     if show_phase:
         safe_addstr(stdscr, row, col_phase, "PHASE", hdr)
-    if show_slug:
-        safe_addstr(stdscr, row, w - slug_w - 2 - model_w - 1, "SLUG", hdr)
     if show_model:
         safe_addstr(stdscr, row, w - model_w - 1, "MODEL", hdr)
     row += 1
     safe_addstr(stdscr, row, 1, "─" * (w - 2), C["dim"])
     row += 1
 
-    for i, s in enumerate(visible):
+    for di, drow in enumerate(visible_rows):
         if row >= h - 1:
             break
 
-        session_abs_idx = scroll_top + i
-        is_cursor = (session_abs_idx == cursor_idx)
-        is_selected = (s.get("pid") == selected_pid)
+        abs_idx = scroll_top + di
+        is_cursor = (abs_idx == cursor_idx)
 
-        pct = s["context_pct"]
-        ctx_color = C["red"] if pct > 80 else (C["amber"] if pct > 50 else C["green"])
-        slug = s.get("slug", "")
-        activity = s.get("activity", "Idle")
-        is_active = activity not in ACTIVITY_IDLE
+        if drow[0] == "separator":
+            if row < h - 1:
+                safe_addstr(stdscr, row, 1, "─" * (w - 2), C["dim"])
+                row += 1
+            continue
 
-        project = s["project"] or "~"
-        model = shorten_model(s["model"])
-        out_tok = format_tokens(s["output_tokens"])
+        if drow[0] == "session":
+            s = drow[1]
+            pct = s["context_pct"]
+            ctx_color = C["red"] if pct > 80 else (C["amber"] if pct > 50 else C["green"])
+            activity = s.get("activity", "Idle")
+            is_active = activity not in ACTIVITY_IDLE
+            project = s["project"] or "~"
+            model = shorten_model(s["model"])
+            out_tok = format_tokens(s["output_tokens"])
+            n_agents = s.get("_n_total_agents", 0)
+            n_active_agents = s.get("_n_active_agents", 0)
 
-        # Turn time: live elapsed when active, last turn duration when waiting
-        turn_time = ""
-        turn_time_color = C["slate"]
-        if is_active and s.get("turn_start_ts"):
-            try:
-                ts = datetime.fromisoformat(s["turn_start_ts"].replace("Z", "+00:00"))
-                elapsed_s = (datetime.now(timezone.utc) - ts).total_seconds()
-                if elapsed_s >= 0:
-                    turn_time = format_time(elapsed_s)
-                    turn_time_color = C["brand"]
-            except (ValueError, TypeError):
-                pass
-        elif not is_active and s.get("last_turn_duration") is not None:
-            turn_time = format_time(s["last_turn_duration"])
-        if not turn_time:
-            turn_time = format_time(s["elapsed"])  # fallback to session uptime
+            # Turn time
+            turn_time = ""
+            turn_time_color = C["slate"]
+            if is_active and s.get("turn_start_ts"):
+                try:
+                    ts = datetime.fromisoformat(s["turn_start_ts"].replace("Z", "+00:00"))
+                    elapsed_s = (datetime.now(timezone.utc) - ts).total_seconds()
+                    if elapsed_s >= 0:
+                        turn_time = format_time(elapsed_s)
+                        turn_time_color = C["brand"]
+                except (ValueError, TypeError):
+                    pass
+            elif not is_active and s.get("last_turn_duration") is not None:
+                turn_time = format_time(s["last_turn_duration"])
+            if not turn_time:
+                turn_time = format_time(s["elapsed"])
 
-        # ── Cursor indicator ──
-        if is_cursor:
-            safe_addstr(stdscr, row, 0, "▸", C["brand"])
+            # Cursor
+            if is_cursor:
+                safe_addstr(stdscr, row, 0, "▸", C["brand"])
 
-        # ── Col 1: Project name ──
-        safe_addstr(stdscr, row, col_proj, truncate(project, proj_w), C["peach"] | curses.A_BOLD)
+            # Collapse/expand indicator
+            if n_agents > 0:
+                is_collapsed = s["pid"] in collapsed_pids
+                indicator = "▶" if is_collapsed else "▼"
+                safe_addstr(stdscr, row, 1, indicator, C["dim"])
 
-        # ── Col 2: Status indicator + word ──
-        if is_active:
-            spinner = SPINNER_FRAMES[spin_frame % len(SPINNER_FRAMES)]
-            word_idx = s["pid"] % len(THINKING_WORDS)
-            fun_word = THINKING_WORDS[word_idx]
-            safe_addstr(stdscr, row, col_status, f"{spinner} {fun_word}…", C["brand"])
-        else:
-            word_idx = s["pid"] % len(DONE_WORDS)
-            safe_addstr(stdscr, row, col_status, f"✻ {DONE_WORDS[word_idx]}", C["slate"])
+            # Project
+            safe_addstr(stdscr, row, col_proj, truncate(project, proj_w), C["peach"] | curses.A_BOLD)
 
-        # ── Col 3: Turn time ──
-        safe_addstr(stdscr, row, col_time, turn_time, turn_time_color)
+            # Status
+            if is_active:
+                spinner = SPINNER_FRAMES[spin_frame % len(SPINNER_FRAMES)]
+                word_idx = s["pid"] % len(THINKING_WORDS)
+                fun_word = THINKING_WORDS[word_idx]
+                safe_addstr(stdscr, row, col_status, f"{spinner} {fun_word}…", C["brand"])
+            else:
+                word_idx = s["pid"] % len(DONE_WORDS)
+                safe_addstr(stdscr, row, col_status, f"✻ {DONE_WORDS[word_idx]}", C["slate"])
 
-        # ── Col 4: Output tokens ──
-        safe_addstr(stdscr, row, col_out, out_tok, C["slate"])
+            # Turn time
+            safe_addstr(stdscr, row, col_time, turn_time, turn_time_color)
 
-        # ── Col 5: Mode (permission mode — icons/colors match Claude Code) ──
-        perm = s.get("permission_mode", "?")
-        perm_info = {
-            "bypassPermissions": ("⏵⏵ Bypass", C["red"]),
-            "dontAsk":           ("⏵⏵ DontAsk", C["red"]),
-            "auto":              ("⏵⏵ Auto", C["amber"]),
-            "acceptEdits":       ("⏵⏵ Accept", C["purple"]),
-            "plan":              ("⏸ Plan", C["teal"]),
-            "default":           ("Default", C["dim"]),
-        }.get(perm)
-        if perm_info:
-            perm_label, perm_color = perm_info
-            safe_addstr(stdscr, row, col_mode, truncate(perm_label, perm_w), perm_color)
+            # Output tokens
+            safe_addstr(stdscr, row, col_out, out_tok, C["slate"])
 
-        # ── Col 6: Context bar (always shown) ──
-        if pct < 25:
-            bar_fg = C["green"]
-        elif pct < 50:
-            bar_fg = C["brand"]
-        elif pct < 80:
-            bar_fg = C["amber"]
-        else:
-            bar_fg = C["red"]
-        draw_bar(stdscr, row, col_bar, bar_w, pct, bar_fg, C["dim"])
-        ctx_label = f" {format_tokens(s['total_context'])}/{format_tokens(s['context_max'])}"
-        safe_addstr(stdscr, row, col_bar + bar_w, ctx_label, ctx_color)
-
-        # ── Col 7: Child processes (optional) ──
-        if show_procs:
-            ct = s.get("child_types", {})
-            if ct:
-                parts = [f"{v} {k}" for k, v in sorted(ct.items(), key=lambda x: -x[1])]
-                procs_str = " · ".join(parts)
-                safe_addstr(stdscr, row, col_procs, truncate(procs_str, procs_w), C["teal"])
-
-        # ── Col 8: Phase (optional) ──
-        if show_phase:
-            phase = get_phase(s)
-            if phase:
-                phase_color = C["brand"] if phase == "thinking" else C["amber"]
-                safe_addstr(stdscr, row, col_phase, truncate(phase, phase_w), phase_color)
-
-        # ── Col 8-9: Slug + Model (optional, right-aligned) ──
-        if show_slug and slug:
-            safe_addstr(stdscr, row, w - slug_w - 2 - model_w - 1, truncate(slug, slug_w), C["dim"])
-        if show_model:
-            safe_addstr(stdscr, row, w - model_w - 1, model, C["beige"])
-        row += 1
-
-        # ── Expanded details (only for selected session) ──
-        if is_selected and row < h - 1:
+            # Mode
             perm = s.get("permission_mode", "?")
-            perm_label = {
-                "bypassPermissions": "bypass",
-                "acceptEdits": "accept-edits",
-                "default": "default",
-                "dontAsk": "dont-ask",
-                "plan": "plan",
-                "auto": "auto",
-            }.get(perm, perm)
+            perm_info = {
+                "bypassPermissions": ("⏵⏵ Bypass", C["red"]),
+                "dontAsk":           ("⏵⏵ DontAsk", C["red"]),
+                "auto":              ("⏵⏵ Auto", C["amber"]),
+                "acceptEdits":       ("⏵⏵ Accept", C["purple"]),
+                "plan":              ("⏸ Plan", C["teal"]),
+                "default":           ("Default", C["dim"]),
+            }.get(perm)
+            if perm_info:
+                perm_label, perm_color = perm_info
+                safe_addstr(stdscr, row, col_mode, truncate(perm_label, perm_w), perm_color)
 
-            stats_parts = [
-                f"Msgs {s['msg_count']}",
-                f"Tools {s['tool_calls']}",
-                f"Out {format_tokens(s['output_tokens'])}",
-                f"PID {s['pid']}",
-                f"MEM {format_bytes(s['mem']).strip()}",
-            ]
-            stats_line = "  │  ".join(stats_parts)
-            safe_addstr(stdscr, row, col_status, truncate(stats_line, w - col_status - 1), C["slate"])
-            perm_str = f" [{perm_label}]"
-            perm_pos = col_status + len(stats_line) + 1
-            if perm_pos + len(perm_str) < w:
-                perm_color = C["amber"] if perm_label == "bypass" else C["dim"]
-                safe_addstr(stdscr, row, perm_pos, perm_str, perm_color)
+            # Context bar
+            if pct < 25:
+                bar_fg = C["green"]
+            elif pct < 50:
+                bar_fg = C["brand"]
+            elif pct < 80:
+                bar_fg = C["amber"]
+            else:
+                bar_fg = C["red"]
+            draw_bar(stdscr, row, col_bar, bar_w, pct, bar_fg, C["dim"])
+            ctx_label = f" {format_tokens(s['total_context'])}/{format_tokens(s['context_max'])}"
+            safe_addstr(stdscr, row, col_bar + bar_w, ctx_label, ctx_color)
+
+            # Agents column
+            if show_agents:
+                if n_agents > 0:
+                    if n_active_agents > 0:
+                        agent_str = f"{n_active_agents}/{n_agents} active"
+                        safe_addstr(stdscr, row, col_agents, agent_str, C["brand"])
+                    else:
+                        agent_str = f"{n_agents} done"
+                        safe_addstr(stdscr, row, col_agents, agent_str, C["slate"])
+
+            # Phase
+            if show_phase:
+                phase = get_phase(s)
+                if phase:
+                    phase_color = C["brand"] if phase == "thinking" else C["amber"]
+                    safe_addstr(stdscr, row, col_phase, truncate(phase, phase_w), phase_color)
+
+            # Model (right-aligned)
+            if show_model:
+                safe_addstr(stdscr, row, w - model_w - 1, model, C["beige"])
             row += 1
 
-            subagents = s.get("subagents", [])
-            if subagents and row < h - 1:
-                agent_strs = [f"{a['type']}: {a['desc']}" for a in subagents[:3]]
-                agent_line = "agents: " + "  │  ".join(agent_strs)
-                safe_addstr(stdscr, row, col_status, truncate(agent_line, w - col_status - 1), C["beige"])
+            # Expanded detail line (for selected_pid)
+            if s["pid"] == selected_pid and row < h - 1:
+                stats_parts = [
+                    f"Msgs {s['msg_count']}",
+                    f"Tools {s['tool_calls']}",
+                    f"Out {format_tokens(s['output_tokens'])}",
+                    f"PID {s['pid']}",
+                    f"MEM {format_bytes(s['mem']).strip()}",
+                ]
+                stats_line = "  │  ".join(stats_parts)
+                safe_addstr(stdscr, row, col_status, truncate(stats_line, w - col_status - 1), C["slate"])
                 row += 1
 
-        # ── Separator ──
-        if row < h - 1:
-            safe_addstr(stdscr, row, 1, "─" * (w - 2), C["dim"])
+        elif drow[0] == "agent":
+            agent = drow[1]
+            parent = drow[2]
+            is_last = drow[3]
+
+            agent_activity = agent.get("activity", "Idle")
+            agent_active = agent_activity not in ACTIVITY_IDLE
+            agent_type = agent.get("type", "?")
+            agent_desc = agent.get("desc", "")
+            agent_pct = agent.get("context_pct", 0)
+            agent_out = format_tokens(agent.get("output_tokens", 0))
+
+            # Tree line
+            tree_char = "└─" if is_last else "├─"
+
+            # Cursor
+            if is_cursor:
+                safe_addstr(stdscr, row, 0, "▸", C["brand"])
+
+            # Tree connector + agent type
+            indent = 4
+            safe_addstr(stdscr, row, indent, tree_char, C["dim"])
+            type_label = truncate(agent_type, 12)
+            safe_addstr(stdscr, row, indent + 3, type_label, C["teal"] | curses.A_BOLD)
+
+            # Agent status (compact)
+            agent_status_col = indent + 3 + 13
+            if agent_active:
+                spinner = SPINNER_FRAMES[spin_frame % len(SPINNER_FRAMES)]
+                # Use agent_id hash for word index
+                word_idx = hash(agent.get("agent_id", "")) % len(THINKING_WORDS)
+                fun_word = THINKING_WORDS[word_idx]
+                safe_addstr(stdscr, row, agent_status_col, f"{spinner} {fun_word}…", C["brand"])
+            else:
+                word_idx = hash(agent.get("agent_id", "")) % len(DONE_WORDS)
+                safe_addstr(stdscr, row, agent_status_col, f"✻ {DONE_WORDS[word_idx]}", C["slate"])
+
+            # Agent turn time
+            agent_time_col = agent_status_col + fun_word_w + 1
+            agent_turn = ""
+            agent_time_color = C["slate"]
+            if agent_active and agent.get("turn_start_ts"):
+                try:
+                    ts = datetime.fromisoformat(agent["turn_start_ts"].replace("Z", "+00:00"))
+                    elapsed_s = (datetime.now(timezone.utc) - ts).total_seconds()
+                    if elapsed_s >= 0:
+                        agent_turn = format_time(elapsed_s)
+                        agent_time_color = C["brand"]
+                except (ValueError, TypeError):
+                    pass
+            elif not agent_active and agent.get("last_turn_duration") is not None:
+                agent_turn = format_time(agent["last_turn_duration"])
+            if agent_turn:
+                safe_addstr(stdscr, row, agent_time_col, agent_turn, agent_time_color)
+
+            # Agent output tokens
+            agent_out_col = agent_time_col + time_w + 1
+            safe_addstr(stdscr, row, agent_out_col, agent_out, C["slate"])
+
+            # Agent context mini-bar
+            agent_bar_col = agent_out_col + out_w + 1
+            mini_bar_w = max(4, bar_w // 2)
+            if agent_bar_col + mini_bar_w + ctx_label_w < w:
+                if agent_pct < 25:
+                    abf = C["green"]
+                elif agent_pct < 50:
+                    abf = C["brand"]
+                elif agent_pct < 80:
+                    abf = C["amber"]
+                else:
+                    abf = C["red"]
+                draw_bar(stdscr, row, agent_bar_col, mini_bar_w, agent_pct, abf, C["dim"])
+                actx = f" {format_tokens(agent.get('total_context', 0))}/{format_tokens(agent.get('context_max', DEFAULT_CONTEXT))}"
+                actx_color = C["red"] if agent_pct > 80 else (C["amber"] if agent_pct > 50 else C["green"])
+                safe_addstr(stdscr, row, agent_bar_col + mini_bar_w, actx, actx_color)
+
+            # Agent description (fill remaining space)
+            desc_col = agent_bar_col + mini_bar_w + ctx_label_w + 2
+            if agent_desc and desc_col < w - 2:
+                desc_w = w - desc_col - 1
+                safe_addstr(stdscr, row, desc_col, truncate(agent_desc, desc_w), C["dim"])
+
             row += 1
 
     return row
@@ -1199,7 +1469,6 @@ def draw_processes_view(stdscr, row, h, w, procs, sort_idx, cursor_idx, C):
     row += 1
 
     avail = h - row - 1
-    # Scroll so cursor is always visible
     scroll_top = 0
     if cursor_idx >= avail:
         scroll_top = cursor_idx - avail + 1
@@ -1249,7 +1518,6 @@ def draw_history_view(stdscr, row, h, w, stats, cursor_idx, C):
     total_messages = stats.get("totalMessages", 0)
     first_date = stats.get("firstSessionDate", "")
 
-    # ── Lifetime stats ──
     safe_addstr(stdscr, row, 1, "LIFETIME STATS", C["brand"] | curses.A_BOLD)
     row += 1
 
@@ -1259,7 +1527,6 @@ def draw_history_view(stdscr, row, h, w, stats, cursor_idx, C):
         safe_addstr(stdscr, row, 50, f"Since: {first_date[:10]}", C["dim"])
     row += 1
 
-    # ── Model usage breakdown ──
     row += 1
     safe_addstr(stdscr, row, 1, "MODEL USAGE (lifetime)", C["brand"] | curses.A_BOLD)
     row += 1
@@ -1285,7 +1552,6 @@ def draw_history_view(stdscr, row, h, w, stats, cursor_idx, C):
         safe_addstr(stdscr, row, 2, shorten_model(model_name), C["peach"])
         row += 1
 
-    # ── Recent daily activity ──
     row += 1
     safe_addstr(stdscr, row, 1, "RECENT DAILY ACTIVITY", C["brand"] | curses.A_BOLD)
     row += 1
@@ -1303,7 +1569,6 @@ def draw_history_view(stdscr, row, h, w, stats, cursor_idx, C):
         scroll_top = 0
         if cursor_idx >= avail:
             scroll_top = cursor_idx - avail + 1
-        # Clamp scroll to valid range
         scroll_top = min(scroll_top, max(0, len(recent) - avail))
         visible = recent[scroll_top: scroll_top + avail]
 
