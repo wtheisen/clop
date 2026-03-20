@@ -1711,8 +1711,10 @@ def _serialize_subagent(a):
     return out
 
 
-def get_active_orchestrators():
+def get_active_orchestrators(sessions=None):
     """Find running orchestrator.sh processes in tmux and parse their config."""
+    if sessions is None:
+        sessions = get_active_sessions()
     orchestrators = []
     try:
         result = subprocess.run(
@@ -1801,11 +1803,10 @@ def get_active_orchestrators():
                         pass
 
                 # Cross-reference worker worktrees with active sessions
-                active_sessions = get_active_sessions()
                 for slug in orch_info["slugs"]:
                     worker_cwd_pattern = f"/tmp/{orch_info['type']}-{slug}"
                     worker = {"slug": slug, "status": "pending", "activity": "", "context_pct": 0}
-                    for sess in active_sessions:
+                    for sess in sessions:
                         if sess.get("cwd", "").startswith(worker_cwd_pattern):
                             worker["status"] = "active" if sess["activity"] not in ACTIVITY_IDLE else "idle"
                             worker["activity"] = sess["activity"]
@@ -1851,7 +1852,7 @@ def _refresh_server_cache():
         try:
             sessions = get_active_sessions()
             procs = find_claude_processes()
-            orchestrators = get_active_orchestrators()
+            orchestrators = get_active_orchestrators(sessions=sessions)
             history = get_stats_cache()
             with _server_cache["lock"]:
                 _server_cache["sessions"] = sessions
