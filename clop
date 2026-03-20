@@ -1037,7 +1037,9 @@ def main(stdscr):
             active_subagent_keys = set()
             for s in cached_sessions:
                 for a in s.get("subagents", []):
-                    active_subagent_keys.add((a["_subagent_dir"], a["agent_id"]))
+                    subdir = a.get("_subagent_dir")
+                    if subdir:
+                        active_subagent_keys.add((subdir, a["agent_id"]))
             for stale_key in set(_subagent_cache) - active_subagent_keys:
                 del _subagent_cache[stale_key]
 
