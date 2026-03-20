@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """clanager: A top-like TUI for managing Claude Code sessions and their subagents."""
 
+import argparse
 import curses
 import json
 import glob
@@ -8,7 +9,10 @@ import time
 import subprocess
 import psutil
 import os
+import sys
+import threading
 from datetime import datetime, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 REFRESH_INTERVAL = 0.08  # seconds (fast spinner animation)
@@ -453,6 +457,36 @@ def _get_subagents(subagent_dir):
     return subagents
 
 
+_worktree_parent_cache = {}  # cwd → parent_cwd or None
+
+
+def _resolve_worktree_parent(cwd):
+    """For git worktrees, follow .git file back to the parent repo path."""
+    if cwd in _worktree_parent_cache:
+        return _worktree_parent_cache[cwd]
+
+    result = None
+    git_file = os.path.join(cwd, ".git")
+    try:
+        if os.path.isfile(git_file):
+            with open(git_file) as f:
+                content = f.read().strip()
+            # Format: "gitdir: /path/to/repo/.git/worktrees/name"
+            if content.startswith("gitdir:"):
+                gitdir = content.split(":", 1)[1].strip()
+                # Strip /worktrees/<name> to get /path/to/repo/.git
+                if "/worktrees/" in gitdir:
+                    main_git = gitdir.split("/worktrees/")[0]
+                    # Strip /.git to get repo path
+                    if main_git.endswith("/.git"):
+                        result = main_git[:-5]
+    except OSError:
+        pass
+
+    _worktree_parent_cache[cwd] = result
+    return result
+
+
 def get_active_sessions():
     """Get all active Claude Code sessions with their metadata."""
     sessions = []
@@ -531,6 +565,10 @@ def get_active_sessions():
             if ctx_info["activity"] in ("Waiting", "Idle") and cpu > 5.0:
                 ctx_info["activity"] = "Active"
 
+            is_worker = cwd.startswith("/tmp/") or cwd.startswith("/private/tmp/")
+            parent_cwd = _resolve_worktree_parent(cwd) if is_worker else None
+            parent_project = os.path.basename(parent_cwd) if parent_cwd else None
+
             sessions.append({
                 "pid": pid,
                 "session_id": session_id,
@@ -541,6 +579,9 @@ def get_active_sessions():
                 "mem": total_mem,
                 "children": n_children,
                 "child_types": child_types,
+                "is_worker": is_worker,
+                "parent_cwd": parent_cwd,
+                "parent_project": parent_project,
                 **ctx_info,
             })
         except (json.JSONDecodeError, ValueError, OSError):
@@ -1628,8 +1669,573 @@ def draw_history_view(stdscr, row, h, w, stats, cursor_idx, C):
     return row
 
 
-if __name__ == "__main__":
+THINKING_WORDS_SET = set(THINKING_WORDS)
+DONE_WORDS_SET = set(DONE_WORDS)
+
+
+def _status_word(activity, pid_or_id):
+    """Resolve a fun status word for JSON API consumers."""
+    is_active = activity not in ACTIVITY_IDLE
+    if isinstance(pid_or_id, int):
+        idx = pid_or_id % len(THINKING_WORDS)
+    else:
+        idx = hash(pid_or_id) % len(THINKING_WORDS)
+    if is_active:
+        return THINKING_WORDS[idx]
+    return DONE_WORDS[idx % len(DONE_WORDS)]
+
+
+def _serialize_session(s):
+    """Serialize a session dict for JSON, stripping internal keys."""
+    out = {}
+    for k, v in s.items():
+        if k.startswith("_"):
+            continue
+        out[k] = v
+    # Add status word
+    out["status_word"] = _status_word(s.get("activity", "Idle"), s.get("pid", 0))
+    # Serialize subagents
+    if "subagents" in out:
+        out["subagents"] = [_serialize_subagent(a) for a in out["subagents"]]
+    return out
+
+
+def _serialize_subagent(a):
+    """Serialize a subagent dict for JSON, stripping internal keys."""
+    out = {}
+    for k, v in a.items():
+        if k.startswith("_"):
+            continue
+        out[k] = v
+    out["status_word"] = _status_word(a.get("activity", "Idle"), a.get("agent_id", ""))
+    return out
+
+
+def get_active_orchestrators():
+    """Find running orchestrator.sh processes in tmux and parse their config."""
+    orchestrators = []
     try:
-        curses.wrapper(main)
-    except KeyboardInterrupt:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_pid}:#{pane_current_command}:#{pane_id}"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode != 0:
+            return orchestrators
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return orchestrators
+
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split(":", 2)
+        if len(parts) < 3:
+            continue
+        pane_pid_str, cmd, pane_id = parts
+        try:
+            pane_pid = int(pane_pid_str)
+        except ValueError:
+            continue
+
+        # Walk descendants of the pane to find orchestrator.sh
+        try:
+            pane_proc = psutil.Process(pane_pid)
+            descendants = [pane_proc] + pane_proc.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+        for desc in descendants:
+            try:
+                cmdline = desc.cmdline()
+                cmdline_str = " ".join(cmdline).lower()
+                if "orchestrator" not in cmdline_str:
+                    continue
+
+                # Try to find config JSON path from cmdline args
+                config_path = None
+                for i, arg in enumerate(cmdline):
+                    if arg.endswith(".json") and os.path.exists(arg):
+                        config_path = arg
+                        break
+
+                orch_info = {
+                    "type": "unknown",
+                    "repo": "",
+                    "item_count": 0,
+                    "elapsed": time.time() - desc.create_time(),
+                    "slugs": [],
+                    "phase": "running",
+                    "workers": [],
+                }
+
+                if config_path:
+                    try:
+                        with open(config_path) as cf:
+                            config = json.load(cf)
+                        orch_info["type"] = config.get("type", "unknown")
+                        orch_info["repo"] = config.get("repo", "")
+                        items = config.get("items", [])
+                        orch_info["item_count"] = len(items)
+                        slugs = [item.get("slug", "") for item in items if isinstance(item, dict)]
+                        orch_info["slugs"] = slugs
+                    except (OSError, json.JSONDecodeError):
+                        pass
+
+                # Try to parse runs.log for recent completed runs
+                runs_log = os.path.expanduser(
+                    "~/Dropbox/linux_files/claude/logs/runs.log"
+                )
+                if os.path.exists(runs_log):
+                    try:
+                        with open(runs_log, "rb") as rl:
+                            rl.seek(max(0, os.path.getsize(runs_log) - 32768))
+                            tail = rl.read().decode("utf-8", errors="replace")
+                        for log_line in tail.strip().split("\n"):
+                            try:
+                                entry = json.loads(log_line)
+                                if entry.get("type") == orch_info["type"]:
+                                    orch_info["phase"] = entry.get("phase", "running")
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                    except OSError:
+                        pass
+
+                # Cross-reference worker worktrees with active sessions
+                active_sessions = get_active_sessions()
+                for slug in orch_info["slugs"]:
+                    worker_cwd_pattern = f"/tmp/{orch_info['type']}-{slug}"
+                    worker = {"slug": slug, "status": "pending", "activity": "", "context_pct": 0}
+                    for sess in active_sessions:
+                        if sess.get("cwd", "").startswith(worker_cwd_pattern):
+                            worker["status"] = "active" if sess["activity"] not in ACTIVITY_IDLE else "idle"
+                            worker["activity"] = sess["activity"]
+                            worker["context_pct"] = sess["context_pct"]
+                            # Derive parent project from worker worktree
+                            if not orch_info["repo"] and sess.get("parent_project"):
+                                orch_info["repo"] = sess["parent_project"]
+                            break
+                    orch_info["workers"].append(worker)
+
+                # Also try to derive repo from worktree if still empty
+                if not orch_info["repo"] and orch_info["slugs"]:
+                    for slug in orch_info["slugs"]:
+                        wt_path = f"/tmp/{orch_info['type']}-{slug}"
+                        parent = _resolve_worktree_parent(wt_path)
+                        if not parent:
+                            parent = _resolve_worktree_parent(f"/private{wt_path}")
+                        if parent:
+                            orch_info["repo"] = os.path.basename(parent)
+                            break
+
+                orchestrators.append(orch_info)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+    return orchestrators
+
+
+# ── HTTP API Server ──
+
+_server_cache = {
+    "sessions": [],
+    "processes": [],
+    "orchestrators": [],
+    "history": {},
+    "lock": threading.Lock(),
+}
+
+
+def _refresh_server_cache():
+    """Background thread: refresh cached data every 2 seconds."""
+    while True:
+        try:
+            sessions = get_active_sessions()
+            procs = find_claude_processes()
+            orchestrators = get_active_orchestrators()
+            history = get_stats_cache()
+            with _server_cache["lock"]:
+                _server_cache["sessions"] = sessions
+                _server_cache["processes"] = procs
+                _server_cache["orchestrators"] = orchestrators
+                _server_cache["history"] = history
+        except Exception as e:
+            print(f"[clop-server] refresh error: {e}", file=sys.stderr)
+        time.sleep(2)
+
+
+ALLOWED_SKILLS = {"improve", "deslop", "envision", "reflect", "learn"}
+# Skills that produce numbered suggestions the user can act on
+SUGGESTION_SKILLS = {"improve", "deslop", "envision"}
+
+import re
+import uuid
+
+_skill_runs = {}  # run_id → {skill, cwd, project, status, result, suggestions, error, started}
+_skill_runs_lock = threading.Lock()
+
+
+def _parse_suggestions(text):
+    """Parse numbered suggestions from skill output.
+
+    Handles multiple formats:
+      - **`fix 1`** — Title here
+      - `fix 1` — Title here
+      ## 1. Title\nDescription...
+      **1. Title**\nDescription...
+    """
+    suggestions = []
+
+    # Format 1: bullet list with `fix N` — used by improve/deslop/envision menu
+    fix_pattern = r'[-*]\s*\*{0,2}`?fix\s+(\d+)`?\*{0,2}\s*[—\-–:]\s*(.+?)(?:\n|$)'
+    fix_matches = list(re.finditer(fix_pattern, text, re.IGNORECASE))
+    if fix_matches:
+        for m in fix_matches:
+            num = int(m.group(1))
+            title = m.group(2).strip().rstrip("*").strip()
+            suggestions.append({"index": num, "title": title, "body": ""})
+        return suggestions
+
+    # Format 2: "N. **bold title** — description" (common skill output)
+    bold_pattern = r'(?:^|\n)\s*(\d+)\.\s*\*\*(.+?)\*\*\s*[—\-–]\s*(.+?)(?=\n\s*\d+\.\s*\*\*|\n\s*##|\Z)'
+    bold_matches = list(re.finditer(bold_pattern, text, re.DOTALL))
+    if bold_matches:
+        for m in bold_matches:
+            num = int(m.group(1))
+            title = m.group(2).strip()
+            body = m.group(3).strip()
+            # Clean up body: remove scope lines, trim
+            body = re.sub(r'\s*Scope:.*$', '', body, flags=re.MULTILINE).strip()
+            suggestions.append({
+                "index": num,
+                "title": title,
+                "body": body[:500],
+            })
+        return suggestions
+
+    # Format 3: "## N. Title" or "### N: Title" headers
+    hdr_pattern = r'(?:^|\n)#{1,3}\s*(\d+)[.\):\-]\s*(.+?)(?:\n|$)'
+    hdr_matches = list(re.finditer(hdr_pattern, text))
+    if hdr_matches:
+        for i, match in enumerate(hdr_matches):
+            num = match.group(1)
+            title = match.group(2).strip().rstrip("*").strip()
+            start = match.end()
+            end = hdr_matches[i + 1].start() if i + 1 < len(hdr_matches) else len(text)
+            body = text[start:end].strip()
+            suggestions.append({
+                "index": int(num),
+                "title": title,
+                "body": body[:500],
+            })
+        return suggestions
+
+    return suggestions
+
+
+SCAN_PROMPTS = {
+    "improve": (
+        "Scan this codebase for bugs, performance issues, and improvements. "
+        "Suggest exactly 3 concrete fixes. For each suggestion, format as:\n"
+        "N. **Title** — Description of the issue and fix.\n"
+        "Do NOT implement anything. Only analyze and suggest."
+    ),
+    "deslop": (
+        "Scan this codebase for bloat, duplication, massive functions, AI slop, "
+        "and unnecessary complexity. Suggest exactly 3 concrete simplifications. "
+        "For each suggestion, format as:\n"
+        "N. **Title** — Description of the issue and simplification.\n"
+        "Do NOT implement anything. Only analyze and suggest."
+    ),
+    "envision": (
+        "Analyze this codebase and suggest 3 ambitious new features or capabilities "
+        "that would meaningfully expand what the project can do. "
+        "For each suggestion, format as:\n"
+        "N. **Title** — Description of the feature and value.\n"
+        "Do NOT implement anything. Only analyze and suggest."
+    ),
+}
+
+
+def _run_skill_background(run_id, skill, cwd):
+    """Background thread: run claude skill and capture output."""
+    try:
+        # For suggestion skills, use scan-only prompt to avoid auto-implementation
+        if skill in SCAN_PROMPTS:
+            prompt = SCAN_PROMPTS[skill]
+        else:
+            prompt = f"/{skill}"
+
+        result = subprocess.run(
+            ["claude", "-p", prompt, "--output-format", "json"],
+            capture_output=True, text=True, cwd=cwd,
+            timeout=300,  # 5 minute timeout
+        )
+        with _skill_runs_lock:
+            run = _skill_runs[run_id]
+            if result.returncode == 0:
+                try:
+                    output = json.loads(result.stdout)
+                    text = output.get("result", "")
+                except (json.JSONDecodeError, KeyError):
+                    text = result.stdout
+
+                run["result"] = text
+                if skill in SUGGESTION_SKILLS:
+                    run["suggestions"] = _parse_suggestions(text)
+                run["status"] = "done"
+            else:
+                run["error"] = result.stderr[:500] or "claude exited with error"
+                run["status"] = "error"
+    except subprocess.TimeoutExpired:
+        with _skill_runs_lock:
+            _skill_runs[run_id]["status"] = "error"
+            _skill_runs[run_id]["error"] = "Timed out after 5 minutes"
+    except Exception as e:
+        with _skill_runs_lock:
+            _skill_runs[run_id]["status"] = "error"
+            _skill_runs[run_id]["error"] = str(e)
+
+
+def run_skill(skill, cwd=None):
+    """Start a skill run in the background. Returns (ok, run_id_or_message)."""
+    if skill not in ALLOWED_SKILLS:
+        return False, f"Unknown skill: {skill}. Allowed: {', '.join(sorted(ALLOWED_SKILLS))}"
+
+    if not cwd:
+        with _server_cache["lock"]:
+            sessions = _server_cache["sessions"]
+        if sessions:
+            active = [s for s in sessions if s.get("activity") not in ACTIVITY_IDLE]
+            cwd = (active[0] if active else sessions[0]).get("cwd", os.path.expanduser("~"))
+        else:
+            cwd = os.path.expanduser("~")
+
+    if not os.path.isdir(cwd):
+        cwd = os.path.expanduser("~")
+
+    run_id = str(uuid.uuid4())[:8]
+    project = os.path.basename(cwd)
+
+    with _skill_runs_lock:
+        _skill_runs[run_id] = {
+            "run_id": run_id,
+            "skill": skill,
+            "cwd": cwd,
+            "project": project,
+            "status": "running",
+            "result": None,
+            "suggestions": [],
+            "error": None,
+            "started": time.time(),
+        }
+
+    t = threading.Thread(target=_run_skill_background, args=(run_id, skill, cwd), daemon=True)
+    t.start()
+
+    return True, run_id
+
+
+def run_suggestions(run_id, indices):
+    """Implement selected suggestions from a skill run.
+
+    Uses the skill's `fix N,N,N` command to launch the orchestrator.
+    """
+    with _skill_runs_lock:
+        run = _skill_runs.get(run_id)
+        if not run:
+            return False, "Run not found"
+        if run["status"] != "done":
+            return False, "Run not complete"
+
+        valid = {s["index"] for s in run["suggestions"]}
+        for idx in indices:
+            if idx not in valid:
+                return False, f"Suggestion {idx} not found"
+
+        cwd = run["cwd"]
+        skill = run["skill"]
+
+    # Build implementation prompts from the selected suggestions
+    selected = [s for s in run.get("suggestions", []) if s["index"] in indices]
+    titles = [s["title"] for s in selected]
+
+    # Build a prompt that implements the selected suggestions
+    parts = [f"Implement these {skill} suggestions for this codebase:\n"]
+    for s in selected:
+        parts.append(f"{s['index']}. **{s['title']}**")
+        if s.get("body"):
+            parts.append(f"   {s['body']}\n")
+        else:
+            parts.append("")
+    prompt = "\n".join(parts)
+
+    # For multiple suggestions, spawn each in its own tmux window
+    try:
+        result = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.returncode != 0:
+            return False, "tmux is not running"
+        tmux_sessions = result.stdout.strip().split("\n")
+        target_session = "main" if "main" in tmux_sessions else tmux_sessions[0]
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False, "tmux not available"
+
+    if len(selected) == 1:
+        # Single suggestion: one window
+        s = selected[0]
+        single_prompt = f"Implement this fix:\n\n**{s['title']}**\n{s.get('body', '')}"
+        window_name = f"{skill}-{s['index']}"
+        escaped = single_prompt.replace("'", "'\\''")
+        claude_cmd = f"cd '{cwd}' && claude -p '{escaped}' --dangerously-skip-permissions"
+        subprocess.run(
+            ["tmux", "new-window", "-t", target_session, "-n", window_name, claude_cmd],
+            capture_output=True, text=True, timeout=5
+        )
+    else:
+        # Multiple: one window per suggestion (parallel workers)
+        for s in selected:
+            single_prompt = f"Implement this fix:\n\n**{s['title']}**\n{s.get('body', '')}"
+            window_name = f"{skill}-{s['index']}"
+            escaped = single_prompt.replace("'", "'\\''")
+            claude_cmd = f"cd '{cwd}' && claude -p '{escaped}' --dangerously-skip-permissions"
+            subprocess.run(
+                ["tmux", "new-window", "-t", target_session, "-n", window_name, claude_cmd],
+                capture_output=True, text=True, timeout=5
+            )
+
+    fix_label = ",".join(str(s["index"]) for s in selected)
+    return True, f"Implementing fix {fix_label}: {', '.join(titles)}"
+
+
+class ClopAPIHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = self.path.split("?")[0].rstrip("/")
+        with _server_cache["lock"]:
+            if path == "/api/sessions":
+                data = [_serialize_session(s) for s in _server_cache["sessions"]]
+            elif path == "/api/processes":
+                data = _server_cache["processes"]
+            elif path == "/api/history":
+                data = _server_cache["history"]
+            elif path == "/api/orchestrators":
+                data = _server_cache["orchestrators"]
+            elif path == "/api/skills":
+                data = {
+                    "available": sorted(ALLOWED_SKILLS),
+                    "projects": list({s["cwd"]: s["project"]
+                                      for s in _server_cache["sessions"]}.items()),
+                }
+            elif path == "/api/skill-runs":
+                with _skill_runs_lock:
+                    data = list(_skill_runs.values())
+            elif path.startswith("/api/skill-runs/"):
+                run_id = path.split("/")[-1]
+                with _skill_runs_lock:
+                    run = _skill_runs.get(run_id)
+                if run:
+                    data = run
+                else:
+                    self.send_error(404, "Run not found")
+                    return
+            else:
+                self.send_error(404, "Not found")
+                return
+
+        body = json.dumps(data, default=str).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        path = self.path.split("?")[0].rstrip("/")
+        if path not in ("/api/run-skill", "/api/run-suggestions"):
+            self.send_error(404, "Not found")
+            return
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > 4096:
+            self.send_error(413, "Payload too large")
+            return
+        raw = self.rfile.read(content_length)
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_error(400, "Invalid JSON")
+            return
+
+        if path == "/api/run-skill":
+            skill = payload.get("skill", "").strip()
+            cwd = payload.get("cwd", "").strip() or None
+            ok, result = run_skill(skill, cwd)
+            if ok:
+                data = {"ok": True, "run_id": result}
+            else:
+                data = {"ok": False, "message": result}
+        else:  # /api/run-suggestions
+            run_id = payload.get("run_id", "").strip()
+            indices = payload.get("indices", [])
+            try:
+                indices = [int(i) for i in indices]
+            except (ValueError, TypeError):
+                indices = []
+            ok, message = run_suggestions(run_id, indices)
+            data = {"ok": ok, "message": message}
+
+        body = json.dumps(data, default=str).encode("utf-8")
+        self.send_response(200 if data["ok"] else 400)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        # Suppress default request logging noise
         pass
+
+
+def serve_mode(port):
+    """Run clop as an HTTP JSON API server."""
+    # Prime caches
+    find_claude_processes()
+
+    # Start background refresh thread
+    t = threading.Thread(target=_refresh_server_cache, daemon=True)
+    t.start()
+
+    # Wait for first data
+    time.sleep(0.5)
+
+    server = HTTPServer(("127.0.0.1", port), ClopAPIHandler)
+    print(f"clop API server listening on http://127.0.0.1:{port}")
+    print(f"  GET  /api/sessions      — active sessions with subagents")
+    print(f"  GET  /api/processes     — Claude-related processes")
+    print(f"  GET  /api/history       — historical stats")
+    print(f"  GET  /api/orchestrators — running orchestrators")
+    print(f"  GET  /api/skills        — available skills and projects")
+    print(f"  POST /api/run-skill     — launch a skill in tmux")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="clanager: monitor Claude Code sessions")
+    parser.add_argument("--serve", nargs="?", const=7483, type=int, metavar="PORT",
+                        help="Run as HTTP API server (default port: 7483)")
+    args = parser.parse_args()
+
+    if args.serve is not None:
+        serve_mode(args.serve)
+    else:
+        try:
+            curses.wrapper(main)
+        except KeyboardInterrupt:
+            pass
