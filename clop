@@ -108,8 +108,11 @@ def safe_addstr(stdscr, y, x, text, attr=0):
 
 
 _proc_cache = {}  # PID → psutil.Process; kept across refreshes for cpu_percent()
+_proc_cache_lock = threading.Lock()
 _subagent_cache = {}  # (subagent_dir, agent_id) → (mtime, parsed_data)
+_subagent_cache_lock = threading.Lock()
 _dir_listing_cache = {}  # dirpath → (mtime, [entries])
+_dir_listing_cache_lock = threading.Lock()
 
 
 def _cached_listdir(dirpath):
@@ -118,14 +121,16 @@ def _cached_listdir(dirpath):
         dir_mtime = os.path.getmtime(dirpath)
     except OSError:
         return []
-    cached = _dir_listing_cache.get(dirpath)
-    if cached and cached[0] == dir_mtime:
-        return cached[1]
+    with _dir_listing_cache_lock:
+        cached = _dir_listing_cache.get(dirpath)
+        if cached and cached[0] == dir_mtime:
+            return cached[1]
     try:
         entries = os.listdir(dirpath)
     except OSError:
         entries = []
-    _dir_listing_cache[dirpath] = (dir_mtime, entries)
+    with _dir_listing_cache_lock:
+        _dir_listing_cache[dirpath] = (dir_mtime, entries)
     return entries
 
 
@@ -432,12 +437,14 @@ def _get_subagents(subagent_dir):
 
         # Check cache
         cache_key = (subagent_dir, agent_id)
-        cached = _subagent_cache.get(cache_key)
+        with _subagent_cache_lock:
+            cached = _subagent_cache.get(cache_key)
         if cached and cached[0] == best_mtime:
             data = cached[1]
         else:
             data = _parse_jsonl_tail(best_path, read_size=128 * 1024)
-            _subagent_cache[cache_key] = (best_mtime, data)
+            with _subagent_cache_lock:
+                _subagent_cache[cache_key] = (best_mtime, data)
 
         subagents.append({
             "agent_id": agent_id,
@@ -509,9 +516,10 @@ def get_active_sessions():
             elapsed = (time.time() * 1000 - started_at) / 1000 if started_at else 0
 
             try:
-                if pid not in _proc_cache:
-                    _proc_cache[pid] = psutil.Process(pid)
-                proc = _proc_cache[pid]
+                with _proc_cache_lock:
+                    if pid not in _proc_cache:
+                        _proc_cache[pid] = psutil.Process(pid)
+                    proc = _proc_cache[pid]
                 cpu = proc.cpu_percent(interval=0)
                 mem = proc.memory_info().rss
                 children = proc.children(recursive=True)
@@ -553,7 +561,8 @@ def get_active_sessions():
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
             except (psutil.NoSuchProcess, psutil.AccessDenied):
-                _proc_cache.pop(pid, None)
+                with _proc_cache_lock:
+                    _proc_cache.pop(pid, None)
                 cpu = 0
                 mem = 0
                 n_children = 0
@@ -587,8 +596,9 @@ def get_active_sessions():
         except (json.JSONDecodeError, ValueError, OSError):
             continue
 
-    for stale_pid in set(_proc_cache) - seen_pids:
-        del _proc_cache[stale_pid]
+    with _proc_cache_lock:
+        for stale_pid in set(_proc_cache) - seen_pids:
+            del _proc_cache[stale_pid]
 
     return sessions
 
@@ -1081,8 +1091,9 @@ def main(stdscr):
                     subdir = a.get("_subagent_dir")
                     if subdir:
                         active_subagent_keys.add((subdir, a["agent_id"]))
-            for stale_key in set(_subagent_cache) - active_subagent_keys:
-                del _subagent_cache[stale_key]
+            with _subagent_cache_lock:
+                for stale_key in set(_subagent_cache) - active_subagent_keys:
+                    del _subagent_cache[stale_key]
 
             # Auto-expand sessions with active agents (unless user manually collapsed)
             for s in cached_sessions:
